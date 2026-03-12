@@ -1,3 +1,4 @@
+from ._internal import ACTIVE, ERROR, QUEUED, SCHEDULED, WAITING
 from .exceptions import (
     JobTimeoutException,
     QueueFullException,
@@ -31,6 +32,12 @@ __all__ = [
     # Schedules
     "periodic",
     "cron_expr",
+    # States
+    "QUEUED",
+    "ACTIVE",
+    "SCHEDULED",
+    "ERROR",
+    "WAITING",
 ]
 
 

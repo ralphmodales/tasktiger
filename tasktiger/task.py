@@ -19,9 +19,11 @@ import redis
 from structlog.stdlib import BoundLogger
 
 from ._internal import (
+    ACTIVE,
     ERROR,
     QUEUED,
     SCHEDULED,
+    WAITING,
     g,
     gen_id,
     gen_unique_id,
@@ -61,6 +63,7 @@ class Task:
         max_queue_size: Optional[int] = None,
         max_stored_executions: Optional[int] = None,
         runner_class: Optional[Type["BaseRunner"]] = None,
+        depends_on: Optional[List["Task"]] = None,
         # internal variables
         _data: Any = None,
         _state: Any = None,
@@ -120,6 +123,11 @@ class Task:
         if runner_class is None:
             runner_class = getattr(func, "_task_runner_class", None)
 
+        if depends_on is None:
+            default_depends_on = getattr(func, "_task_depends_on", None)
+            if default_depends_on:
+                depends_on = list(default_depends_on)
+
         # normalize falsy args/kwargs to empty structures
         args = args or []
         kwargs = kwargs or {}
@@ -135,7 +143,7 @@ class Task:
         else:
             task_id = gen_id()
 
-        task: Dict[str, Any] = {"id": task_id, "func": serialized_name}
+        task: Dict[str, Any] = {"id": task_id, "func": serialized_name, "queue": queue}
         if unique or unique_key:
             task["unique"] = True
             if unique_key:
@@ -164,6 +172,9 @@ class Task:
         if runner_class:
             serialized_runner_class = serialize_func_name(runner_class)
             task["runner_class"] = serialized_runner_class
+
+        if depends_on:
+            task["depends_on"] = [t.id for t in depends_on]
 
         self._data = task
 
@@ -265,6 +276,10 @@ class Task:
     @property
     def max_stored_executions(self) -> Optional[int]:
         return self._data.get("max_stored_executions")
+
+    @property
+    def depends_on_ids(self) -> List[str]:
+        return self._data.get("depends_on", [])
 
     @property
     def serialized_runner_class(self) -> str:
@@ -373,9 +388,9 @@ class Task:
         else:
             state = SCHEDULED
 
-        # When using ALWAYS_EAGER, make sure we have serialized the task to
-        # ensure there are no serialization errors.
-        serialized_task = json.dumps(self._data)
+        dep_ids = self._data.get("depends_on", [])
+        pending_dep_ids: List[str] = []
+        errored_dep_ids: List[str] = []
 
         if max_queue_size:
             # This will fail adding a unique task that already is queued but
@@ -385,7 +400,53 @@ class Task:
                 raise QueueFullException("Queue size: {}".format(queue_size))
 
         if tiger.config["ALWAYS_EAGER"] and state == QUEUED:
+            json.dumps(self._data)
             return self.execute()
+
+        if dep_ids:
+            pending_dep_ids, errored_dep_ids = self._classify_dependencies(dep_ids)
+
+        if errored_dep_ids:
+            serialized_task = json.dumps(self._data)
+            pipeline = tiger.connection.pipeline()
+            pipeline.sadd(tiger._key(ERROR), self.queue)
+            pipeline.set(tiger._key("task", self.id), serialized_task)
+            tiger.scripts.zadd(
+                tiger._key(ERROR, self.queue),
+                now,
+                self.id,
+                mode="nx",
+                client=pipeline,
+            )
+            pipeline.execute()
+            self._state = ERROR
+            self._ts = now
+            return
+
+        if pending_dep_ids:
+            self._data["waiting_since"] = now
+            serialized_task = json.dumps(self._data)
+            pipeline = tiger.connection.pipeline()
+            pipeline.sadd(tiger._key(WAITING), self.queue)
+            pipeline.set(tiger._key("task", self.id), serialized_task)
+            tiger.scripts.zadd(
+                tiger._key(WAITING, self.queue),
+                ts,
+                self.id,
+                mode="nx",
+                client=pipeline,
+            )
+            pipeline.execute()
+            tiger.connection.sadd(
+                tiger._key("task", self.id, "depends_on"), *pending_dep_ids
+            )
+            for dep_id in pending_dep_ids:
+                tiger.connection.sadd(tiger._key("task", dep_id, "dependents"), self.id)
+            self._state = WAITING
+            self._ts = ts
+            return
+
+        serialized_task = json.dumps(self._data)
 
         pipeline = tiger.connection.pipeline()
         pipeline.sadd(tiger._key(state), self.queue)
@@ -404,6 +465,62 @@ class Task:
 
         self._state = state
         self._ts = ts
+
+    def _classify_dependencies(self, dep_ids: List[str]) -> Tuple[List[str], List[str]]:
+        tiger = self.tiger
+
+        pipeline = tiger.connection.pipeline()
+        task_keys = [tiger._key("task", dep_id) for dep_id in dep_ids]
+        pipeline.mget(task_keys)
+        dep_task_raws = pipeline.execute()[0]
+
+        dep_queues: List[Optional[str]] = []
+        for raw in dep_task_raws:
+            if not raw:
+                dep_queues.append(None)
+                continue
+            try:
+                dep_data = json.loads(raw)
+            except Exception:
+                dep_queues.append(None)
+            else:
+                dep_queues.append(dep_data.get("queue"))
+
+        pipeline = tiger.connection.pipeline()
+        for dep_id, dep_queue in zip(dep_ids, dep_queues):
+            if not dep_queue:
+                continue
+            pipeline.zscore(tiger._key(QUEUED, dep_queue), dep_id)
+            pipeline.zscore(tiger._key(ACTIVE, dep_queue), dep_id)
+            pipeline.zscore(tiger._key(SCHEDULED, dep_queue), dep_id)
+            pipeline.zscore(tiger._key(WAITING, dep_queue), dep_id)
+            pipeline.zscore(tiger._key(ERROR, dep_queue), dep_id)
+
+        scores = pipeline.execute() if dep_ids else []
+
+        pending_dep_ids: List[str] = []
+        errored_dep_ids: List[str] = []
+
+        idx = 0
+        for dep_id, dep_queue in zip(dep_ids, dep_queues):
+            if not dep_queue:
+                continue
+            queued_score, active_score, scheduled_score, waiting_score, error_score = scores[
+                idx : idx + 5
+            ]
+            idx += 5
+
+            if error_score is not None:
+                errored_dep_ids.append(dep_id)
+            elif (
+                queued_score is not None
+                or active_score is not None
+                or scheduled_score is not None
+                or waiting_score is not None
+            ):
+                pending_dep_ids.append(dep_id)
+
+        return pending_dep_ids, errored_dep_ids
 
     def update_scheduled_time(
         self, when: Optional[Union[datetime.timedelta, datetime.datetime]]
@@ -585,14 +702,251 @@ class Task:
 
         return int(executions_count or 0)
 
+    def cancel_waiting(self) -> None:
+        tiger = self.tiger
+        pipeline = tiger.connection.pipeline()
+        pipeline.zrem(tiger._key(WAITING, self.queue), self.id)
+        pipeline.execute()
+        waiting_count = tiger.connection.zcard(tiger._key(WAITING, self.queue))
+        if waiting_count == 0:
+            tiger.connection.srem(tiger._key(WAITING), self.queue)
+
+        dep_ids = self.depends_on_ids
+        for dep_id in dep_ids:
+            tiger.connection.srem(tiger._key("task", dep_id, "dependents"), self.id)
+        tiger.connection.delete(tiger._key("task", self.id, "depends_on"))
+
+        self._cascade_failure_to_dependents()
+
+        tiger.connection.delete(tiger._key("task", self.id))
+        self._state = None
+
+    def _cascade_failure_to_dependents(self) -> None:
+        tiger = self.tiger
+        dep_task_ids = tiger.connection.smembers(
+            tiger._key("task", self.id, "dependents")
+        )
+        for dep_task_id in dep_task_ids:
+            task_data_raw = tiger.connection.get(tiger._key("task", dep_task_id))
+            if task_data_raw:
+                task_data = json.loads(task_data_raw)
+                dep_queue = task_data.get("queue", self.queue)
+                ts = time.time()
+                pipeline = tiger.connection.pipeline()
+                pipeline.zrem(tiger._key(WAITING, dep_queue), dep_task_id)
+                pipeline.sadd(tiger._key(ERROR), dep_queue)
+                tiger.scripts.zadd(
+                    tiger._key(ERROR, dep_queue),
+                    ts,
+                    dep_task_id,
+                    mode="nx",
+                    client=pipeline,
+                )
+                pipeline.execute()
+                waiting_count = tiger.connection.zcard(
+                    tiger._key(WAITING, dep_queue)
+                )
+                if waiting_count == 0:
+                    tiger.connection.srem(tiger._key(WAITING), dep_queue)
+                dep_task = Task(
+                    tiger, queue=dep_queue, _data=task_data, _state=ERROR
+                )
+                dep_task._cascade_failure_to_dependents()
+
+                for orig_dep_id in task_data.get("depends_on", []):
+                    tiger.connection.srem(
+                        tiger._key("task", orig_dep_id, "dependents"),
+                        dep_task_id,
+                    )
+
+            
+        tiger.connection.delete(tiger._key("task", self.id, "dependents"))
+
+    def get_dependents(self) -> List[str]:
+        tiger = self.tiger
+        return list(
+            tiger.connection.smembers(tiger._key("task", self.id, "dependents"))
+        )
+
+    def get_pending_dependencies(self) -> List[str]:
+        tiger = self.tiger
+        return list(
+            tiger.connection.smembers(tiger._key("task", self.id, "depends_on"))
+        )
+
+    def get_dependency_status(self) -> List[Dict[str, Any]]:
+        tiger = self.tiger
+        dep_ids = self._data.get("depends_on", [])
+        if not dep_ids:
+            return []
+
+        pipeline = tiger.connection.pipeline()
+        task_keys = [tiger._key("task", dep_id) for dep_id in dep_ids]
+        pipeline.mget(task_keys)
+        dep_task_raws = pipeline.execute()[0]
+
+        result = []
+        for dep_id, raw in zip(dep_ids, dep_task_raws):
+            if not raw:
+                result.append({"id": dep_id, "state": "done", "func": ""})
+                continue
+            try:
+                dep_data = json.loads(raw)
+            except Exception:
+                result.append({"id": dep_id, "state": "unknown", "func": ""})
+                continue
+
+            dep_queue = dep_data.get("queue")
+            current_state = "done"
+            if dep_queue:
+                state_pipeline = tiger.connection.pipeline()
+                for st in (ACTIVE, QUEUED, WAITING, SCHEDULED, ERROR):
+                    state_pipeline.zscore(tiger._key(st, dep_queue), dep_id)
+                st_scores = state_pipeline.execute()
+                state_map = [ACTIVE, QUEUED, WAITING, SCHEDULED, ERROR]
+                for st_name, st_score in zip(state_map, st_scores):
+                    if st_score is not None:
+                        current_state = st_name
+                        break
+
+            result.append({
+                "id": dep_id,
+                "state": current_state,
+                "func": dep_data.get("func", ""),
+            })
+
+        return result
+
+    def get_dependency_chain(self) -> List[Dict[str, Any]]:
+        tiger = self.tiger
+        chain = []
+        visited = set()
+        stack = [self.id]
+
+        while stack:
+            task_id = stack.pop()
+            if task_id in visited:
+                continue
+            visited.add(task_id)
+
+            task_data_raw = tiger.connection.get(tiger._key("task", task_id))
+            if not task_data_raw:
+                continue
+
+            task_data = json.loads(task_data_raw)
+            dep_task_ids = list(
+                tiger.connection.smembers(tiger._key("task", task_id, "depends_on"))
+            )
+            dependent_ids = list(
+                tiger.connection.smembers(tiger._key("task", task_id, "dependents"))
+            )
+
+            in_waiting = False
+            in_queued = False
+            in_active = False
+            in_error = False
+
+            all_queues = tiger.connection.smembers(tiger._key(WAITING)) | \
+                tiger.connection.smembers(tiger._key(QUEUED)) | \
+                tiger.connection.smembers(tiger._key(ACTIVE)) | \
+                tiger.connection.smembers(tiger._key(ERROR))
+
+            for q in all_queues:
+                if tiger.connection.zscore(tiger._key(WAITING, q), task_id) is not None:
+                    in_waiting = True
+                if tiger.connection.zscore(tiger._key(QUEUED, q), task_id) is not None:
+                    in_queued = True
+                if tiger.connection.zscore(tiger._key(ACTIVE, q), task_id) is not None:
+                    in_active = True
+                if tiger.connection.zscore(tiger._key(ERROR, q), task_id) is not None:
+                    in_error = True
+
+            if in_active:
+                current_state = ACTIVE
+            elif in_queued:
+                current_state = QUEUED
+            elif in_waiting:
+                current_state = WAITING
+            elif in_error:
+                current_state = ERROR
+            else:
+                current_state = "done"
+
+            chain.append({
+                "id": task_id,
+                "func": task_data.get("func", ""),
+                "state": current_state,
+                "pending_deps": dep_task_ids,
+                "dependents": dependent_ids,
+            })
+
+            for tid in dep_task_ids + dependent_ids:
+                if tid not in visited:
+                    stack.append(tid)
+
+        return chain
+
     def retry(self) -> None:
         """
-        Retries a task that's in the error queue.
+        Retries a task that's in the error queue. If the task has
+        dependencies, re-evaluates their state: if any dependency is still
+        pending, the task moves back to WAITING instead of QUEUED. If any
+        dependency is in the error state, the task stays in ERROR.
 
         Raises TaskNotFound if the task could not be found in the ERROR
         queue.
         """
-        self._move(from_state=ERROR, to_state=QUEUED)
+        dep_ids = self._data.get("depends_on", [])
+        if not dep_ids:
+            self._move(from_state=ERROR, to_state=QUEUED)
+            return
+
+        tiger = self.tiger
+        pending_dep_ids, errored_dep_ids = self._classify_dependencies(dep_ids)
+
+        if errored_dep_ids:
+            return
+
+        if not pending_dep_ids:
+            self._move(from_state=ERROR, to_state=QUEUED)
+            return
+
+        score = tiger.connection.zscore(
+            tiger._key(ERROR, self.queue), self.id
+        )
+        if score is None:
+            raise TaskNotFound(
+                'Task {} not found in queue "{}" in state "{}".'.format(
+                    self.id, self.queue, ERROR
+                )
+            )
+
+        ts = time.time()
+        self._data["waiting_since"] = ts
+        pipeline = tiger.connection.pipeline()
+        pipeline.zrem(tiger._key(ERROR, self.queue), self.id)
+        pipeline.sadd(tiger._key(WAITING), self.queue)
+        tiger.scripts.zadd(
+            tiger._key(WAITING, self.queue),
+            ts,
+            self.id,
+            mode="nx",
+            client=pipeline,
+        )
+        pipeline.execute()
+
+        error_count = tiger.connection.zcard(tiger._key(ERROR, self.queue))
+        if error_count == 0:
+            tiger.connection.srem(tiger._key(ERROR), self.queue)
+
+        tiger.connection.sadd(
+            tiger._key("task", self.id, "depends_on"), *pending_dep_ids
+        )
+        for dep_id in pending_dep_ids:
+            tiger.connection.sadd(
+                tiger._key("task", dep_id, "dependents"), self.id
+            )
+        self._state = WAITING
 
     def cancel(self) -> None:
         """

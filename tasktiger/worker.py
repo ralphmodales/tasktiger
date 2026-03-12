@@ -22,6 +22,7 @@ from typing import (
     Union,
 )
 
+import redis
 from redis.client import PubSub
 from redis.exceptions import LockError
 from structlog.stdlib import BoundLogger
@@ -31,6 +32,7 @@ from ._internal import (
     ERROR,
     QUEUED,
     SCHEDULED,
+    WAITING,
     dotted_parts,
     gen_unique_id,
     import_attribute,
@@ -687,6 +689,139 @@ class Worker:
 
         return success, ready_tasks
 
+    def _resolve_task_dependents(self, task: Task) -> None:
+        dep_task_ids = self.connection.smembers(
+            self._key("task", task.id, "dependents")
+        )
+        for dep_task_id in dep_task_ids:
+            lock = self.connection.lock(
+                self._key("lock", "depends", dep_task_id), timeout=10, blocking_timeout=1
+            )
+            acquired = False
+            try:
+                acquired = lock.acquire(blocking=True)
+                if not acquired:
+                    continue
+
+                self.connection.srem(
+                    self._key("task", dep_task_id, "depends_on"), task.id
+                )
+
+                depends_on_key = self._key("task", dep_task_id, "depends_on")
+                task_key = self._key("task", dep_task_id)
+                task_data_raw = self.connection.get(task_key)
+                if not task_data_raw:
+                    continue
+
+                task_data = json.loads(task_data_raw)
+                dep_queue = task_data.get("queue", task.queue)
+                waiting_key = self._key(WAITING, dep_queue)
+
+                with self.connection.pipeline() as pipe:
+                    try:
+                        pipe.watch(depends_on_key, waiting_key)
+                        remaining = pipe.scard(depends_on_key)
+                        waiting_score = pipe.zscore(waiting_key, dep_task_id)
+                        if remaining != 0 or waiting_score is None:
+                            pipe.unwatch()
+                            continue
+
+                        now = time.time()
+                        if waiting_score > now:
+                            to_state = SCHEDULED
+                            score = waiting_score
+                        else:
+                            to_state = QUEUED
+                            score = now
+
+                        pipe.multi()
+                        pipe.zrem(waiting_key, dep_task_id)
+                        pipe.sadd(self._key(to_state), dep_queue)
+                        self.tiger.scripts.zadd(
+                            self._key(to_state, dep_queue),
+                            score,
+                            dep_task_id,
+                            mode="nx",
+                            client=pipe,
+                        )
+                        if (
+                            to_state == QUEUED
+                            and self.tiger.config["PUBLISH_QUEUED_TASKS"]
+                        ):
+                            pipe.publish(self._key("activity"), dep_queue)
+                        pipe.execute()
+                    except redis.WatchError:
+                        continue
+
+                waiting_count = self.connection.zcard(waiting_key)
+                if waiting_count == 0:
+                    self.connection.srem(self._key(WAITING), dep_queue)
+            finally:
+                if acquired:
+                    try:
+                        lock.release()
+                    except LockError:
+                        pass
+        
+
+    def _fail_task_dependents(self, task: Task) -> None:
+        dep_task_ids = self.connection.smembers(
+            self._key("task", task.id, "dependents")
+        )
+        for dep_task_id in dep_task_ids:
+            lock = self.connection.lock(
+                self._key("lock", "depends_fail", dep_task_id),
+                timeout=10,
+                blocking_timeout=1,
+            )
+            acquired = False
+            try:
+                acquired = lock.acquire(blocking=True)
+                if not acquired:
+                    continue
+
+                task_data_raw = self.connection.get(self._key("task", dep_task_id))
+                if task_data_raw:
+                    task_data = json.loads(task_data_raw)
+                    dep_queue = task_data.get("queue", task.queue)
+                    ts = time.time()
+                    pipeline = self.connection.pipeline()
+                    pipeline.zrem(self._key(WAITING, dep_queue), dep_task_id)
+                    pipeline.sadd(self._key(ERROR), dep_queue)
+                    self.tiger.scripts.zadd(
+                        self._key(ERROR, dep_queue),
+                        ts,
+                        dep_task_id,
+                        mode="nx",
+                        client=pipeline,
+                    )
+                    pipeline.execute()
+                    waiting_count = self.connection.zcard(self._key(WAITING, dep_queue))
+                    if waiting_count == 0:
+                        self.connection.srem(self._key(WAITING), dep_queue)
+                    dep_task_obj = Task(
+                        self.tiger,
+                        queue=dep_queue,
+                        _data=task_data,
+                        _state=ERROR,
+                    )
+                    self._fail_task_dependents(dep_task_obj)
+
+                    for orig_dep_id in task_data.get("depends_on", []):
+                        self.connection.srem(
+                            self._key("task", orig_dep_id, "dependents"),
+                            dep_task_id,
+                        )
+
+                
+            finally:
+                if acquired:
+                    try:
+                        lock.release()
+                    except LockError:
+                        pass
+        self.connection.delete(self._key("task", task.id, "dependents"))
+
     def _finish_task_processing(
         self, queue: str, task: Task, success: bool, start_time: float
     ) -> None:
@@ -717,6 +852,7 @@ class Worker:
 
         if success:
             _mark_done()
+            self._resolve_task_dependents(task)
         else:
             should_retry = False
             should_log_error = True
@@ -825,12 +961,15 @@ class Worker:
             # queue if we don't want to retry.
             if state == ERROR and not should_log_error:
                 _mark_done()
+                self._fail_task_dependents(task)
             else:
                 task._move(from_state=ACTIVE, to_state=state, when=when)
                 if state == ERROR and task.serialized_runner_class:
                     runner_class = get_runner_class(log, [task])
                     runner = runner_class(self.tiger)
                     runner.on_permanent_error(task, execution)
+                if state == ERROR:
+                    self._fail_task_dependents(task)
 
             # Exit the process with an error code if a task timed out to
             # prevent any inconsistent state in case the runner requires it.
@@ -867,7 +1006,200 @@ class Worker:
         ):
             self._worker_queue_scheduled_tasks()
             self._worker_queue_expired_tasks()
+            self._cleanup_stale_waiting_tasks()
             self._last_task_check = time.time()
+
+    def _cleanup_stale_waiting_tasks(self) -> None:
+        waiting_queues = self.connection.smembers(self._key(WAITING))
+        filtered_queues = self._filter_queues(list(waiting_queues))
+        waiting_timeout = self.config.get("WAITING_TASK_TIMEOUT")
+
+        for queue in filtered_queues:
+            waiting_key = self._key(WAITING, queue)
+            task_ids_with_scores = self.connection.zrange(
+                waiting_key, 0, -1, withscores=True
+            )
+
+            for task_id, task_score in task_ids_with_scores:
+                task_data_raw = self.connection.get(self._key("task", task_id))
+                if not task_data_raw:
+                    pipeline = self.connection.pipeline()
+                    pipeline.zrem(waiting_key, task_id)
+                    pipeline.execute()
+                    continue
+
+                task_data = json.loads(task_data_raw)
+
+                if waiting_timeout is not None:
+                    now = time.time()
+                    waiting_since = task_data.get("waiting_since")
+                    if waiting_since is None:
+                        waiting_since = task_score
+                    if now - waiting_since > waiting_timeout:
+                        ts = now
+                        pipeline = self.connection.pipeline()
+                        pipeline.zrem(waiting_key, task_id)
+                        pipeline.sadd(self._key(ERROR), queue)
+                        self.tiger.scripts.zadd(
+                            self._key(ERROR, queue),
+                            ts,
+                            task_id,
+                            mode="nx",
+                            client=pipeline,
+                        )
+                        pipeline.execute()
+                        self.connection.delete(
+                            self._key("task", task_id, "depends_on")
+                        )
+                        dep_ids = self.connection.smembers(
+                            self._key("task", task_id, "dependents")
+                        )
+                        if dep_ids:
+                            timeout_task = Task(
+                                self.tiger,
+                                queue=queue,
+                                _data=task_data,
+                                _state=ERROR,
+                            )
+                            self._fail_task_dependents(timeout_task)
+                        continue
+
+                pending_deps = self.connection.smembers(
+                    self._key("task", task_id, "depends_on")
+                )
+
+                if not pending_deps:
+                    waiting_score = self.connection.zscore(waiting_key, task_id)
+                    if waiting_score is None:
+                        pipeline = self.connection.pipeline()
+                        pipeline.zrem(waiting_key, task_id)
+                        pipeline.execute()
+                        continue
+
+                    now = time.time()
+                    if waiting_score > now:
+                        to_state = SCHEDULED
+                        score = waiting_score
+                    else:
+                        to_state = QUEUED
+                        score = now
+
+                    pipeline = self.connection.pipeline()
+                    pipeline.zrem(waiting_key, task_id)
+                    pipeline.sadd(self._key(to_state), queue)
+                    self.tiger.scripts.zadd(
+                        self._key(to_state, queue),
+                        score,
+                        task_id,
+                        mode="nx",
+                        client=pipeline,
+                    )
+                    if to_state == QUEUED and self.tiger.config["PUBLISH_QUEUED_TASKS"]:
+                        pipeline.publish(self._key("activity"), queue)
+                    pipeline.execute()
+                    continue
+
+                all_stale = True
+                for dep_id in pending_deps:
+                    dep_data_raw = self.connection.get(self._key("task", dep_id))
+                    if dep_data_raw:
+                        dep_exists_in_queue = False
+                        dep_data = json.loads(dep_data_raw)
+                        dep_queue_name = dep_data.get("queue")
+                        if dep_queue_name:
+                            check_queues = [dep_queue_name]
+                        else:
+                            check_queues = list(
+                                self.connection.smembers(self._key(QUEUED))
+                                | self.connection.smembers(self._key(ACTIVE))
+                                | self.connection.smembers(self._key(SCHEDULED))
+                                | self.connection.smembers(self._key(WAITING))
+                            )
+                        pipeline = self.connection.pipeline()
+                        for q in check_queues:
+                            pipeline.zscore(self._key(QUEUED, q), dep_id)
+                            pipeline.zscore(self._key(ACTIVE, q), dep_id)
+                            pipeline.zscore(self._key(SCHEDULED, q), dep_id)
+                            pipeline.zscore(self._key(WAITING, q), dep_id)
+                        scores = pipeline.execute()
+                        if any(s is not None for s in scores):
+                            dep_exists_in_queue = True
+                        if dep_exists_in_queue:
+                            all_stale = False
+                            break
+
+                        dep_in_error = False
+                        error_queues = list(
+                            self.connection.smembers(self._key(ERROR))
+                        )
+                        pipeline = self.connection.pipeline()
+                        for q in error_queues:
+                            pipeline.zscore(self._key(ERROR, q), dep_id)
+                        error_scores = pipeline.execute()
+                        if any(s is not None for s in error_scores):
+                            dep_in_error = True
+
+                        if dep_in_error:
+                            task_data = json.loads(task_data_raw)
+                            ts = time.time()
+                            pipeline = self.connection.pipeline()
+                            pipeline.zrem(waiting_key, task_id)
+                            pipeline.sadd(self._key(ERROR), queue)
+                            self.tiger.scripts.zadd(
+                                self._key(ERROR, queue),
+                                ts,
+                                task_id,
+                                mode="nx",
+                                client=pipeline,
+                            )
+                            pipeline.execute()
+                            self.connection.delete(
+                                self._key("task", task_id, "depends_on")
+                            )
+                            all_stale = False
+                            break
+                    else:
+                        self.connection.srem(
+                            self._key("task", task_id, "depends_on"), dep_id
+                        )
+
+                if all_stale:
+                    remaining = self.connection.scard(
+                        self._key("task", task_id, "depends_on")
+                    )
+                    if remaining == 0:
+                        waiting_score = self.connection.zscore(waiting_key, task_id)
+                        if waiting_score is None:
+                            pipeline = self.connection.pipeline()
+                            pipeline.zrem(waiting_key, task_id)
+                            pipeline.execute()
+                            continue
+
+                        now = time.time()
+                        if waiting_score > now:
+                            to_state = SCHEDULED
+                            score = waiting_score
+                        else:
+                            to_state = QUEUED
+                            score = now
+
+                        pipeline = self.connection.pipeline()
+                        pipeline.zrem(waiting_key, task_id)
+                        pipeline.sadd(self._key(to_state), queue)
+                        self.tiger.scripts.zadd(
+                            self._key(to_state, queue),
+                            score,
+                            task_id,
+                            mode="nx",
+                            client=pipeline,
+                        )
+                        if to_state == QUEUED and self.tiger.config["PUBLISH_QUEUED_TASKS"]:
+                            pipeline.publish(self._key("activity"), queue)
+                        pipeline.execute()
+
+            remaining_waiting = self.connection.zcard(waiting_key)
+            if remaining_waiting == 0:
+                self.connection.srem(self._key(WAITING), queue)
 
     def _queue_periodic_tasks(self) -> None:
         # Only queue periodic tasks for queues this worker is responsible

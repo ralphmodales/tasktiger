@@ -1,4 +1,6 @@
 import datetime
+import json
+import time
 import importlib
 import logging
 from collections import defaultdict
@@ -25,8 +27,10 @@ from ._internal import (
     ERROR,
     QUEUED,
     SCHEDULED,
+    WAITING,
     classproperty,
     g,
+    gen_id,
     queue_matches,
     serialize_func_name,
 )
@@ -49,6 +53,7 @@ SET <prefix>:queued
 SET <prefix>:active
 SET <prefix>:error
 SET <prefix>:scheduled
+SET <prefix>:waiting
 
 Serialized task for the given task ID.
 STRING <prefix>:task:<task_id>
@@ -74,6 +79,10 @@ ZSET <prefix>:error:<queue>
 Task IDs that are scheduled to be executed at a specific time, scored by the
 time they should be executed.
 ZSET <prefix>:scheduled:<queue>
+
+Task IDs waiting for dependencies in the given queue, scored by the time the
+task was queued.
+ZSET <prefix>:waiting:<queue>
 
 Channel that receives the queue name as a message whenever a task is queued.
 CHANNEL <prefix>:activity
@@ -222,6 +231,7 @@ class TaskTiger:
             # Whether to publish new tasks to the activity channel. Only set to
             # False if all the workers are polling queues.
             "PUBLISH_QUEUED_TASKS": True,
+            "WAITING_TASK_TIMEOUT": None,
         }
         if config:
             self.config.update(config)
@@ -320,6 +330,7 @@ class TaskTiger:
         max_queue_size: Optional[int] = None,
         max_stored_executions: Optional[int] = None,
         runner_class: Optional[Type["BaseRunner"]] = None,
+        depends_on: Optional[List["Task"]] = None,
     ) -> Callable:
         """
         Function decorator that defines the behavior of the function when it is
@@ -368,6 +379,8 @@ class TaskTiger:
                 func._task_max_stored_executions = max_stored_executions  # type: ignore[attr-defined]
             if runner_class is not None:
                 func._task_runner_class = runner_class  # type: ignore[attr-defined]
+            if depends_on is not None:
+                func._task_depends_on = depends_on  # type: ignore[attr-defined]
 
             func.delay = _delay(func)  # type: ignore[attr-defined]
 
@@ -447,6 +460,7 @@ class TaskTiger:
         max_queue_size: Optional[int] = None,
         max_stored_executions: Optional[int] = None,
         runner_class: Optional[Type["BaseRunner"]] = None,
+        depends_on: Optional[List["Task"]] = None,
     ) -> Task:
         """
         Queues a task. See README.rst for an explanation of the options.
@@ -468,6 +482,7 @@ class TaskTiger:
             retry_method=retry_method,
             max_stored_executions=max_stored_executions,
             runner_class=runner_class,
+            depends_on=depends_on,
         )
 
         task.delay(when=when, max_queue_size=max_queue_size)
@@ -479,7 +494,7 @@ class TaskTiger:
         Get the queue's number of tasks in each state.
 
         Returns dict with queue size for the QUEUED, SCHEDULED, and ACTIVE
-        states. Does not include size of error queue.
+        states. Does not include size of error or waiting queue.
         """
 
         states = [QUEUED, SCHEDULED, ACTIVE]
@@ -541,13 +556,13 @@ class TaskTiger:
         """
         Returns a dict with stats about all the queues. The keys are the queue
         names, the values are dicts representing how many tasks are in a given
-        status ("queued", "active", "error" or "scheduled").
+        status ("queued", "active", "error", "scheduled", or "waiting").
 
         Example return value:
         { "default": { "queued": 1, "error": 2 } }
         """
 
-        states = (QUEUED, ACTIVE, SCHEDULED, ERROR)
+        states = (QUEUED, ACTIVE, SCHEDULED, ERROR, WAITING)
 
         pipeline = self.connection.pipeline()
         for state in states:
@@ -647,6 +662,107 @@ class TaskTiger:
 
         total_processed = 0
         for idx, task in enumerate(errored_tasks()):
+            dep_meta_keys = [
+                self._key("task", task.id, "dependents"),
+                self._key("task", task.id, "depends_on"),
+            ]
+            dep_ids_from_set = self.connection.smembers(
+                self._key("task", task.id, "depends_on")
+            )
+            dep_ids_from_data = set(task.data.get("depends_on", []))
+            all_dep_ids = dep_ids_from_set | dep_ids_from_data
+            for dep_id in all_dep_ids:
+                self.connection.srem(
+                    self._key("task", dep_id, "dependents"), task.id
+                )
+
+            dependent_ids = self.connection.smembers(
+                self._key("task", task.id, "dependents")
+            )
+            for dependent_id in dependent_ids:
+                self.connection.srem(
+                    self._key("task", dependent_id, "depends_on"), task.id
+                )
+                dependent_raw = self.connection.get(self._key("task", dependent_id))
+                if not dependent_raw:
+                    continue
+                try:
+                    dependent_data = json.loads(dependent_raw)
+                except Exception:
+                    continue
+
+                dep_list = dependent_data.get("depends_on", [])
+                if task.id in dep_list:
+                    dependent_data["depends_on"] = [d for d in dep_list if d != task.id]
+                    self.connection.set(
+                        self._key("task", dependent_id), json.dumps(dependent_data)
+                    )
+
+            for depends_on_key in self.connection.scan_iter(
+                match=self._key("task", "*", "depends_on")
+            ):
+                if not self.connection.sismember(depends_on_key, task.id):
+                    continue
+                parts = depends_on_key.split(":")
+                if len(parts) < 4:
+                    continue
+                dependent_id = parts[2]
+                self.connection.srem(depends_on_key, task.id)
+                dependent_raw = self.connection.get(self._key("task", dependent_id))
+                if dependent_raw:
+                    try:
+                        dependent_data = json.loads(dependent_raw)
+                    except Exception:
+                        dependent_data = None
+                    if dependent_data is not None:
+                        dep_list = dependent_data.get("depends_on", [])
+                        if task.id in dep_list:
+                            dependent_data["depends_on"] = [
+                                d for d in dep_list if d != task.id
+                            ]
+                            self.connection.set(
+                                self._key("task", dependent_id),
+                                json.dumps(dependent_data),
+                            )
+
+                        dependent_queue = dependent_data.get("queue")
+                        if dependent_queue:
+                            remaining = self.connection.scard(depends_on_key)
+                            if remaining == 0:
+                                waiting_score = self.connection.zscore(
+                                    self._key(WAITING, dependent_queue), dependent_id
+                                )
+                                if waiting_score is not None:
+                                    now = time.time()
+                                    if waiting_score > now:
+                                        to_state = SCHEDULED
+                                        score = waiting_score
+                                    else:
+                                        to_state = QUEUED
+                                        score = now
+                                    pipeline = self.connection.pipeline()
+                                    pipeline.zrem(
+                                        self._key(WAITING, dependent_queue),
+                                        dependent_id,
+                                    )
+                                    pipeline.sadd(self._key(to_state), dependent_queue)
+                                    self.scripts.zadd(
+                                        self._key(to_state, dependent_queue),
+                                        score,
+                                        dependent_id,
+                                        mode="nx",
+                                        client=pipeline,
+                                    )
+                                    if (
+                                        to_state == QUEUED
+                                        and self.config["PUBLISH_QUEUED_TASKS"]
+                                    ):
+                                        pipeline.publish(
+                                            self._key("activity"), dependent_queue
+                                        )
+                                    pipeline.execute()
+            self.connection.delete(*dep_meta_keys)
+
             task.delete()
 
             total_processed = idx + 1
@@ -654,6 +770,163 @@ class TaskTiger:
                 break
 
         return total_processed
+
+    def chain(
+        self,
+        tasks: List[Task],
+        queue: Optional[str] = None,
+    ) -> List[Task]:
+        if not tasks:
+            return []
+
+        result = []
+        prev_task = None
+
+        for task_obj in tasks:
+            if prev_task is not None:
+                chained = task_obj.clone()
+                chained._data["depends_on"] = [prev_task.id]
+                chained._data["id"] = gen_id()
+                if queue:
+                    chained._data["queue"] = queue
+                    chained._queue = queue
+                chained._state = None
+                chained._ts = None
+                chained._executions = []
+                chained.delay()
+                result.append(chained)
+                prev_task = chained
+            else:
+                if task_obj._state is None:
+                    task_obj.delay()
+                result.append(task_obj)
+                prev_task = task_obj
+
+        return result
+
+    def get_waiting_queues(self) -> set:
+        return self.connection.smembers(self._key(WAITING))
+
+    def group(
+        self,
+        tasks: List[Task],
+        completion_task: Optional[Task] = None,
+    ) -> List[Task]:
+        """
+        Delays all tasks in the group to run in parallel. If completion_task
+        is provided, it will be delayed with depends_on set to all group
+        tasks so it runs only after every group member completes.
+
+        Returns the list of delayed tasks including the completion task
+        (if provided) as the last element.
+        """
+        if not tasks:
+            return []
+
+        delayed: List[Task] = []
+        for task_obj in tasks:
+            if task_obj._state is None:
+                task_obj.delay()
+            delayed.append(task_obj)
+
+        if completion_task is not None:
+            comp = completion_task.clone()
+            comp._data["depends_on"] = [t.id for t in delayed]
+            comp._data["id"] = gen_id()
+            comp._state = None
+            comp._ts = None
+            comp._executions = []
+            comp.delay()
+            delayed.append(comp)
+
+        return delayed
+
+    def get_waiting_tasks(
+        self,
+        queue: str,
+        skip: int = 0,
+        limit: int = 1000,
+    ) -> Tuple[int, List[Task]]:
+        return Task.tasks_from_queue(
+            self,
+            queue,
+            WAITING,
+            skip=skip,
+            limit=limit,
+        )
+
+    def purge_waiting_tasks(
+        self,
+        queues: Optional[List[str]] = None,
+        exclude_queues: Optional[List[str]] = None,
+        limit: int = 5000,
+    ) -> int:
+        only_queues = set(queues or self.config["ONLY_QUEUES"] or [])
+        exclude_queues_ = set(exclude_queues or self.config["EXCLUDE_QUEUES"] or [])
+
+        def waiting_tasks() -> Iterable[Task]:
+            queues_with_waiting = self.connection.smembers(self._key(WAITING))
+            for queue in queues_with_waiting:
+                if not queue_matches(
+                    queue,
+                    only_queues=only_queues,
+                    exclude_queues=exclude_queues_,
+                ):
+                    continue
+
+                skip = 0
+                total_tasks: Optional[int] = None
+                task_limit = 5000
+                while total_tasks is None or skip < total_tasks:
+                    total_tasks, tasks = Task.tasks_from_queue(
+                        self,
+                        queue,
+                        WAITING,
+                        skip=skip,
+                        limit=task_limit,
+                    )
+                    for task in tasks:
+                        yield task
+                    skip += task_limit
+
+        total_processed = 0
+        for idx, task in enumerate(waiting_tasks()):
+            task.cancel_waiting()
+            total_processed = idx + 1
+            if limit and total_processed >= limit:
+                break
+
+        return total_processed
+
+    def get_dependency_graph(
+        self,
+        queue: str,
+    ) -> Dict[str, List[str]]:
+        graph: Dict[str, List[str]] = {}
+
+        waiting_key = self._key(WAITING, queue)
+        task_ids = self.connection.zrange(waiting_key, 0, -1)
+
+        queued_key = self._key(QUEUED, queue)
+        active_key = self._key(ACTIVE, queue)
+        scheduled_key = self._key(SCHEDULED, queue)
+        error_key = self._key(ERROR, queue)
+
+        for state_key in [queued_key, active_key, scheduled_key, error_key]:
+            task_ids.extend(self.connection.zrange(state_key, 0, -1))
+
+        seen = set()
+        for task_id in task_ids:
+            if task_id in seen:
+                continue
+            seen.add(task_id)
+            dependents = self.connection.smembers(
+                self._key("task", task_id, "dependents")
+            )
+            if dependents:
+                graph[task_id] = list(dependents)
+
+        return graph
 
     def would_process_configured_queue(self, queue_name: str) -> bool:
         """
