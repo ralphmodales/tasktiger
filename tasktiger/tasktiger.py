@@ -29,8 +29,10 @@ from ._internal import (
     SCHEDULED,
     WAITING,
     classproperty,
+    cleanup_waiting_set,
     g,
     gen_id,
+    promote_task_from_waiting,
     queue_matches,
     serialize_func_name,
 )
@@ -706,34 +708,18 @@ class TaskTiger:
                             self._key(WAITING, dependent_queue), dependent_id
                         )
                         if waiting_score is not None:
-                            now = time.time()
-                            if waiting_score > now:
-                                to_state = SCHEDULED
-                                score = waiting_score
-                            else:
-                                to_state = QUEUED
-                                score = now
-                            pipeline = self.connection.pipeline()
-                            pipeline.zrem(
-                                self._key(WAITING, dependent_queue),
+                            promote_task_from_waiting(
+                                self.connection,
+                                self.scripts,
+                                self._key,
+                                self.config,
                                 dependent_id,
+                                dependent_queue,
+                                waiting_score,
                             )
-                            pipeline.sadd(self._key(to_state), dependent_queue)
-                            self.scripts.zadd(
-                                self._key(to_state, dependent_queue),
-                                score,
-                                dependent_id,
-                                mode="nx",
-                                client=pipeline,
+                            cleanup_waiting_set(
+                                self.connection, self._key, dependent_queue
                             )
-                            if (
-                                to_state == QUEUED
-                                and self.config["PUBLISH_QUEUED_TASKS"]
-                            ):
-                                pipeline.publish(
-                                    self._key("activity"), dependent_queue
-                                )
-                            pipeline.execute()
             self.connection.delete(*dep_meta_keys)
 
             task.delete()

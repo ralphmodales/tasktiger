@@ -24,11 +24,13 @@ from ._internal import (
     QUEUED,
     SCHEDULED,
     WAITING,
+    cleanup_waiting_set,
     g,
     gen_id,
     gen_unique_id,
     get_timestamp,
     import_attribute,
+    move_waiting_task_to_error,
     serialize_func_name,
     serialize_retry_method,
 )
@@ -705,20 +707,10 @@ class Task:
     def cancel_waiting(self) -> None:
         tiger = self.tiger
         ts = time.time()
-        pipeline = tiger.connection.pipeline()
-        pipeline.zrem(tiger._key(WAITING, self.queue), self.id)
-        pipeline.sadd(tiger._key(ERROR), self.queue)
-        tiger.scripts.zadd(
-            tiger._key(ERROR, self.queue),
-            ts,
-            self.id,
-            mode="nx",
-            client=pipeline,
+        move_waiting_task_to_error(
+            tiger.connection, tiger.scripts, tiger._key, self.id, self.queue, ts
         )
-        pipeline.execute()
-        waiting_count = tiger.connection.zcard(tiger._key(WAITING, self.queue))
-        if waiting_count == 0:
-            tiger.connection.srem(tiger._key(WAITING), self.queue)
+        cleanup_waiting_set(tiger.connection, tiger._key, self.queue)
 
         dep_ids = self.depends_on_ids
         for dep_id in dep_ids:
@@ -740,23 +732,11 @@ class Task:
             if task_data_raw:
                 task_data = json.loads(task_data_raw)
                 dep_queue = task_data.get("queue", self.queue)
-                ts = time.time()
-                pipeline = tiger.connection.pipeline()
-                pipeline.zrem(tiger._key(WAITING, dep_queue), dep_task_id)
-                pipeline.sadd(tiger._key(ERROR), dep_queue)
-                tiger.scripts.zadd(
-                    tiger._key(ERROR, dep_queue),
-                    ts,
-                    dep_task_id,
-                    mode="nx",
-                    client=pipeline,
+                move_waiting_task_to_error(
+                    tiger.connection, tiger.scripts, tiger._key,
+                    dep_task_id, dep_queue,
                 )
-                pipeline.execute()
-                waiting_count = tiger.connection.zcard(
-                    tiger._key(WAITING, dep_queue)
-                )
-                if waiting_count == 0:
-                    tiger.connection.srem(tiger._key(WAITING), dep_queue)
+                cleanup_waiting_set(tiger.connection, tiger._key, dep_queue)
                 dep_task = Task(
                     tiger, queue=dep_queue, _data=task_data, _state=ERROR
                 )

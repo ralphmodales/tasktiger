@@ -21,6 +21,10 @@ from typing import (
     Union,
 )
 
+import time as _time
+
+import redis as _redis
+
 from .exceptions import TaskImportError
 
 if TYPE_CHECKING:
@@ -194,6 +198,72 @@ def queue_matches(
         if part in only_queues:
             return True
     return not only_queues
+
+
+def promote_task_from_waiting(
+    conn: "_redis.StrictRedis",
+    scripts: Any,
+    key_func: Callable,
+    config: dict,
+    task_id: str,
+    queue: str,
+    waiting_score: float,
+    pipeline: Any = None,
+) -> None:
+    now = _time.time()
+    if waiting_score > now:
+        to_state = SCHEDULED
+        score = waiting_score
+    else:
+        to_state = QUEUED
+        score = now
+
+    pipe = pipeline or conn.pipeline()
+    pipe.zrem(key_func(WAITING, queue), task_id)
+    pipe.sadd(key_func(to_state), queue)
+    scripts.zadd(
+        key_func(to_state, queue),
+        score,
+        task_id,
+        mode="nx",
+        client=pipe,
+    )
+    if to_state == QUEUED and config["PUBLISH_QUEUED_TASKS"]:
+        pipe.publish(key_func("activity"), queue)
+    if pipeline is None:
+        pipe.execute()
+
+
+def move_waiting_task_to_error(
+    conn: "_redis.StrictRedis",
+    scripts: Any,
+    key_func: Callable,
+    task_id: str,
+    queue: str,
+    ts: Optional[float] = None,
+) -> None:
+    if ts is None:
+        ts = _time.time()
+    pipeline = conn.pipeline()
+    pipeline.zrem(key_func(WAITING, queue), task_id)
+    pipeline.sadd(key_func(ERROR), queue)
+    scripts.zadd(
+        key_func(ERROR, queue),
+        ts,
+        task_id,
+        mode="nx",
+        client=pipeline,
+    )
+    pipeline.execute()
+
+
+def cleanup_waiting_set(
+    conn: "_redis.StrictRedis",
+    key_func: Callable,
+    queue: str,
+) -> None:
+    if conn.zcard(key_func(WAITING, queue)) == 0:
+        conn.srem(key_func(WAITING), queue)
 
 
 class classproperty(property):
