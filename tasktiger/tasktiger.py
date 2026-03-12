@@ -680,9 +680,9 @@ class TaskTiger:
                 self._key("task", task.id, "dependents")
             )
             for dependent_id in dependent_ids:
-                self.connection.srem(
-                    self._key("task", dependent_id, "depends_on"), task.id
-                )
+                depends_on_key = self._key("task", dependent_id, "depends_on")
+                self.connection.srem(depends_on_key, task.id)
+
                 dependent_raw = self.connection.get(self._key("task", dependent_id))
                 if not dependent_raw:
                     continue
@@ -698,69 +698,42 @@ class TaskTiger:
                         self._key("task", dependent_id), json.dumps(dependent_data)
                     )
 
-            for depends_on_key in self.connection.scan_iter(
-                match=self._key("task", "*", "depends_on")
-            ):
-                if not self.connection.sismember(depends_on_key, task.id):
-                    continue
-                parts = depends_on_key.split(":")
-                if len(parts) < 4:
-                    continue
-                dependent_id = parts[2]
-                self.connection.srem(depends_on_key, task.id)
-                dependent_raw = self.connection.get(self._key("task", dependent_id))
-                if dependent_raw:
-                    try:
-                        dependent_data = json.loads(dependent_raw)
-                    except Exception:
-                        dependent_data = None
-                    if dependent_data is not None:
-                        dep_list = dependent_data.get("depends_on", [])
-                        if task.id in dep_list:
-                            dependent_data["depends_on"] = [
-                                d for d in dep_list if d != task.id
-                            ]
-                            self.connection.set(
-                                self._key("task", dependent_id),
-                                json.dumps(dependent_data),
+                dependent_queue = dependent_data.get("queue")
+                if dependent_queue:
+                    remaining = self.connection.scard(depends_on_key)
+                    if remaining == 0:
+                        waiting_score = self.connection.zscore(
+                            self._key(WAITING, dependent_queue), dependent_id
+                        )
+                        if waiting_score is not None:
+                            now = time.time()
+                            if waiting_score > now:
+                                to_state = SCHEDULED
+                                score = waiting_score
+                            else:
+                                to_state = QUEUED
+                                score = now
+                            pipeline = self.connection.pipeline()
+                            pipeline.zrem(
+                                self._key(WAITING, dependent_queue),
+                                dependent_id,
                             )
-
-                        dependent_queue = dependent_data.get("queue")
-                        if dependent_queue:
-                            remaining = self.connection.scard(depends_on_key)
-                            if remaining == 0:
-                                waiting_score = self.connection.zscore(
-                                    self._key(WAITING, dependent_queue), dependent_id
+                            pipeline.sadd(self._key(to_state), dependent_queue)
+                            self.scripts.zadd(
+                                self._key(to_state, dependent_queue),
+                                score,
+                                dependent_id,
+                                mode="nx",
+                                client=pipeline,
+                            )
+                            if (
+                                to_state == QUEUED
+                                and self.config["PUBLISH_QUEUED_TASKS"]
+                            ):
+                                pipeline.publish(
+                                    self._key("activity"), dependent_queue
                                 )
-                                if waiting_score is not None:
-                                    now = time.time()
-                                    if waiting_score > now:
-                                        to_state = SCHEDULED
-                                        score = waiting_score
-                                    else:
-                                        to_state = QUEUED
-                                        score = now
-                                    pipeline = self.connection.pipeline()
-                                    pipeline.zrem(
-                                        self._key(WAITING, dependent_queue),
-                                        dependent_id,
-                                    )
-                                    pipeline.sadd(self._key(to_state), dependent_queue)
-                                    self.scripts.zadd(
-                                        self._key(to_state, dependent_queue),
-                                        score,
-                                        dependent_id,
-                                        mode="nx",
-                                        client=pipeline,
-                                    )
-                                    if (
-                                        to_state == QUEUED
-                                        and self.config["PUBLISH_QUEUED_TASKS"]
-                                    ):
-                                        pipeline.publish(
-                                            self._key("activity"), dependent_queue
-                                        )
-                                    pipeline.execute()
+                            pipeline.execute()
             self.connection.delete(*dep_meta_keys)
 
             task.delete()

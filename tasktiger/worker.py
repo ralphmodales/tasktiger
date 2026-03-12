@@ -808,6 +808,8 @@ class Worker:
                     self._fail_task_dependents(dep_task_obj)
 
                     for orig_dep_id in task_data.get("depends_on", []):
+                        if orig_dep_id == task.id:
+                            continue
                         self.connection.srem(
                             self._key("task", orig_dep_id, "dependents"),
                             dep_task_id,
@@ -820,7 +822,6 @@ class Worker:
                         lock.release()
                     except LockError:
                         pass
-        self.connection.delete(self._key("task", task.id, "dependents"))
 
     def _finish_task_processing(
         self, queue: str, task: Task, success: bool, start_time: float

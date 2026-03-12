@@ -763,14 +763,12 @@ class Task:
                 dep_task._cascade_failure_to_dependents()
 
                 for orig_dep_id in task_data.get("depends_on", []):
+                    if orig_dep_id == self.id:
+                        continue
                     tiger.connection.srem(
                         tiger._key("task", orig_dep_id, "dependents"),
                         dep_task_id,
                     )
-
-            
-        tiger.connection.delete(tiger._key("task", self.id, "dependents"))
-
     def get_dependents(self) -> List[str]:
         tiger = self.tiger
         return list(
