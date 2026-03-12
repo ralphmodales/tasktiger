@@ -704,8 +704,17 @@ class Task:
 
     def cancel_waiting(self) -> None:
         tiger = self.tiger
+        ts = time.time()
         pipeline = tiger.connection.pipeline()
         pipeline.zrem(tiger._key(WAITING, self.queue), self.id)
+        pipeline.sadd(tiger._key(ERROR), self.queue)
+        tiger.scripts.zadd(
+            tiger._key(ERROR, self.queue),
+            ts,
+            self.id,
+            mode="nx",
+            client=pipeline,
+        )
         pipeline.execute()
         waiting_count = tiger.connection.zcard(tiger._key(WAITING, self.queue))
         if waiting_count == 0:
@@ -718,8 +727,8 @@ class Task:
 
         self._cascade_failure_to_dependents()
 
-        tiger.connection.delete(tiger._key("task", self.id))
-        self._state = None
+        self._state = ERROR
+        self._ts = ts
 
     def _cascade_failure_to_dependents(self) -> None:
         tiger = self.tiger

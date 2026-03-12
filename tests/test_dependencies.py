@@ -428,7 +428,7 @@ class TestDependencies:
         b_task.cancel_waiting()
 
         assert _get_state_count(tiger, "default", WAITING) == 0
-        assert _get_state_count(tiger, "default", ERROR) == 1
+        assert _get_state_count(tiger, "default", ERROR) == 2
 
     def test_waiting_task_timeout_moves_to_error(self, tiger, redis):
         redis.delete("task_order")
@@ -445,6 +445,37 @@ class TestDependencies:
             args=("B",),
             kwargs={"key": "task_order"},
             depends_on=[dep],
+        )
+
+        assert _get_state_count(tiger, "default", WAITING) == 1
+
+        time.sleep(0.3)
+
+        Worker(tiger, queues=["default"]).run(once=True, force_once=True)
+
+        assert _get_state_count(tiger, "default", WAITING) == 0
+        assert _get_state_count(tiger, "default", ERROR) == 1
+
+        tiger.config["WAITING_TASK_TIMEOUT"] = None
+
+    def test_waiting_timeout_applies_even_if_task_was_scheduled_in_future(
+        self, tiger, redis
+    ):
+        redis.delete("task_order")
+        tiger.config["WAITING_TASK_TIMEOUT"] = 0.1
+
+        dep = tiger.delay(
+            record_order,
+            args=("A",),
+            kwargs={"key": "task_order"},
+            queue="stuck",
+        )
+        tiger.delay(
+            record_order,
+            args=("B",),
+            kwargs={"key": "task_order"},
+            depends_on=[dep],
+            when=datetime.timedelta(seconds=60),
         )
 
         assert _get_state_count(tiger, "default", WAITING) == 1
