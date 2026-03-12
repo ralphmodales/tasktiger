@@ -523,9 +523,9 @@ class TestDependencies:
         purged = tiger.purge_errored_tasks(queues=["a"])
         assert purged == 1
 
-        dep_ids_from_task = Task.from_id(tiger, "default", ERROR, dependent.id).data.get(
-            "depends_on", []
-        )
+        dep_ids_from_task = Task.from_id(
+            tiger, "default", ERROR, dependent.id
+        ).depends_on_ids
         assert dep.id not in dep_ids_from_task
 
         assert dependent.id not in other.get_dependents()
