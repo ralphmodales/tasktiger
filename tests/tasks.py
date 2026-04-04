@@ -237,3 +237,18 @@ class MyErrorRunnerClass(DefaultRunner):
         assert execution["exception_name"] == "builtins:Exception"
         with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
             conn.set("task_id", task.id)
+
+
+@tiger.task(rate_limit='2/s')
+def rate_limited_task():
+    pass
+
+
+@tiger.task(rate_limit='5/m')
+def rate_limited_slow_task():
+    pass
+
+
+@tiger.task(queue='rate_limited_queue')
+def queue_rate_limited_task():
+    pass

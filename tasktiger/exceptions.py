@@ -62,3 +62,7 @@ class TaskNotFound(Exception):
     """
     The task was not found or does not exist in the given queue/state.
     """
+
+
+class RateLimitedException(Exception):
+    pass

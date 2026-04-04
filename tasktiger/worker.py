@@ -667,6 +667,80 @@ class Worker:
 
             ready_tasks.append(task)
 
+        actually_ready = []
+        rl = self.tiger.rate_limiter
+        use_backoff = self.config.get('RATE_LIMIT_BACKOFF_ENABLED', False)
+        backoff_base = self.config.get('RATE_LIMIT_BACKOFF_BASE', 1.0)
+        backoff_max = self.config.get('RATE_LIMIT_BACKOFF_MAX', 60.0)
+        backoff_factor = self.config.get('RATE_LIMIT_BACKOFF_FACTOR', 2.0)
+        burst_config = self.config.get('RATE_LIMIT_BURST', {})
+
+        for task in ready_tasks:
+            limits = rl.get_effective_limits(
+                queue,
+                task.serialized_func,
+                task.rate_limit,
+                self.config['RATE_LIMITS'],
+            )
+
+            if limits:
+                all_allowed = True
+                max_retry_after = 0.0
+                rejected_key = None
+
+                for key, count, window in limits:
+                    burst = burst_config.get(queue, 0)
+                    if burst > 0:
+                        allowed, retry_after = rl.consume_with_burst(
+                            key, count, window, burst
+                        )
+                    else:
+                        allowed, retry_after = rl.consume(
+                            key, count, window
+                        )
+                    if not allowed:
+                        all_allowed = False
+                        max_retry_after = max(max_retry_after, retry_after)
+                        rejected_key = key
+                        break
+
+                if not all_allowed:
+                    base_delay = max(
+                        max_retry_after,
+                        self.config['RATE_LIMIT_RETRY_DELAY'],
+                    )
+
+                    if use_backoff and rejected_key:
+                        penalty_name = rejected_key.split(':')[-1] if ':' in rejected_key else queue
+                        rl.record_penalty(penalty_name)
+                        base_delay = rl.compute_backoff_delay(
+                            penalty_name,
+                            base_delay,
+                            max_delay=backoff_max,
+                            factor=backoff_factor,
+                        )
+
+                    rl.record_rejection(queue)
+
+                    when = time.time() + base_delay
+                    task._move(
+                        from_state=ACTIVE,
+                        to_state=SCHEDULED,
+                        when=when,
+                        mode='min',
+                    )
+                    log.info(
+                        'rate limited',
+                        task_id=task.id,
+                        retry_after=base_delay,
+                        queue=queue,
+                    )
+                    continue
+
+            actually_ready.append(task)
+
+        ready_tasks = actually_ready
+
         if not ready_tasks:
             return True, []
 
