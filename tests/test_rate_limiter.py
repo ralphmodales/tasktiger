@@ -2,9 +2,8 @@ import time
 
 import pytest
 
-from tasktiger import Task, Worker
+from tasktiger import RateLimitedException, Task, Worker
 from tasktiger._internal import ACTIVE, ERROR, QUEUED, SCHEDULED
-from tasktiger.exceptions import RateLimitedException
 from tasktiger.rate_limiter import (
     RateLimitInfo,
     RateLimiter,
@@ -12,13 +11,25 @@ from tasktiger.rate_limiter import (
     parse_rate_limit,
 )
 
-from .tasks import (
-    queue_rate_limited_task,
-    rate_limited_slow_task,
-    rate_limited_task,
-    simple_task,
-)
-from .utils import external_worker
+from .tasks import simple_task
+from .utils import external_worker, get_tiger
+
+_tiger = get_tiger()
+
+
+@_tiger.task(rate_limit='2/s')
+def rate_limited_task():
+    pass
+
+
+@_tiger.task(rate_limit='5/m')
+def rate_limited_slow_task():
+    pass
+
+
+@_tiger.task(queue='rate_limited_queue')
+def queue_rate_limited_task():
+    pass
 
 
 class TestParseRateLimit:
@@ -159,13 +170,18 @@ class TestRateLimiter:
         self.limiter.set_rate_limit('myqueue', '100/m')
         assert self.limiter.get_rate_limit('myqueue') == '100/m'
 
-    def test_clear_rate_limit(self):
+    def test_clear_rate_limit_removes_config(self):
+        self.limiter.set_rate_limit('myqueue', '100/m')
+        self.limiter.clear_rate_limit('myqueue')
+        assert self.limiter.get_rate_limit('myqueue') is None
+
+    def test_clear_rate_limit_preserves_window(self):
         self.limiter.set_rate_limit('myqueue', '100/m')
         key = self.limiter._rate_limit_key('myqueue')
         self.limiter.consume(key, 100, 60.0)
+        self.limiter.consume(key, 100, 60.0)
         self.limiter.clear_rate_limit('myqueue')
-        assert self.limiter.get_rate_limit('myqueue') is None
-        assert self.conn.exists(key) == 0
+        assert self.conn.exists(key) == 1
 
     def test_consume_amount_greater_than_one(self):
         key = self.limiter._rate_limit_key('test_amount')
@@ -218,6 +234,30 @@ class TestRateLimiter:
             self.limiter.consume_with_burst(key, 3, 60.0, burst=0)
         allowed, _ = self.limiter.consume_with_burst(key, 3, 60.0, burst=0)
         assert allowed is False
+
+    def test_consume_multi_atomic_all_or_nothing(self):
+        key_a = self.limiter._rate_limit_key('multi_a')
+        key_b = self.limiter._rate_limit_key('multi_b')
+        for _ in range(3):
+            self.limiter.consume(key_b, 3, 60.0)
+        allowed, _ = self.limiter.consume_multi([
+            (key_a, 5, 60.0),
+            (key_b, 3, 60.0),
+        ])
+        assert allowed is False
+        status_a = self.limiter.get_status(key_a, 5, 60.0)
+        assert status_a['used'] == 0
+
+    def test_consume_multi_commits_all_on_success(self):
+        key_a = self.limiter._rate_limit_key('multi_ok_a')
+        key_b = self.limiter._rate_limit_key('multi_ok_b')
+        allowed, _ = self.limiter.consume_multi([
+            (key_a, 5, 60.0),
+            (key_b, 5, 60.0),
+        ])
+        assert allowed is True
+        assert self.limiter.get_status(key_a, 5, 60.0)['used'] == 1
+        assert self.limiter.get_status(key_b, 5, 60.0)['used'] == 1
 
     def test_set_invalid_rate_limit(self):
         with pytest.raises(ValueError):
@@ -443,6 +483,13 @@ class TestRateLimitIntegration:
         task = Task(self.tiger, simple_task)
         assert task.rate_limit is None
 
+    def test_delay_with_rate_limit_kwarg(self):
+        task = self.tiger.delay(simple_task, rate_limit='10/m')
+        assert task.rate_limit == '10/m'
+        self._ensure_queues(queued={'default': 1})
+        Worker(self.tiger).run(once=True)
+        self._ensure_queues(queued={'default': 0})
+
     def test_rate_limit_decorator(self):
         self.tiger.delay(rate_limited_task)
         self._ensure_queues(queued={'default': 1})
@@ -454,7 +501,6 @@ class TestRateLimitIntegration:
             self.tiger.delay(rate_limited_task)
         self._ensure_queues(queued={'default': 5})
         Worker(self.tiger).run(once=True)
-        queued_count = self.conn.zcard('t:queued:default')
         scheduled_count = self.conn.zcard('t:scheduled:default')
         assert scheduled_count > 0
 
@@ -474,6 +520,15 @@ class TestRateLimitIntegration:
         self._ensure_queues(queued={'api.v1': 5})
         Worker(self.tiger).run(once=True)
         scheduled_count = self.conn.zcard('t:scheduled:api.v1')
+        assert scheduled_count > 0
+
+    def test_dynamic_parent_queue_limit_subqueue_inheritance(self):
+        self.tiger.set_queue_rate_limit('api', '2/s')
+        for _ in range(5):
+            self.tiger.delay(simple_task, queue='api.v2')
+        self._ensure_queues(queued={'api.v2': 5})
+        Worker(self.tiger).run(once=True)
+        scheduled_count = self.conn.zcard('t:scheduled:api.v2')
         assert scheduled_count > 0
 
     def test_dynamic_rate_limit(self):
@@ -657,28 +712,33 @@ class TestRateLimitIntegration:
         assert self.tiger.validate_rate_limit('10/s') is True
         assert self.tiger.validate_rate_limit('bad') is False
 
-    def test_burst_config_allows_extra(self):
+    def test_burst_config_allows_more_than_base(self):
         self.tiger.config['RATE_LIMIT_BURST'] = {'default': 3}
         self.tiger.set_queue_rate_limit('default', '2/s')
-        for _ in range(5):
+        for _ in range(8):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
         scheduled_count = self.conn.zcard('t:scheduled:default')
-        executed = 5 - scheduled_count
-        assert executed >= 2
+        executed = 8 - scheduled_count
+        assert executed > 2
+        assert executed <= 5
 
-    def test_backoff_increases_delay(self):
+    def test_backoff_produces_growing_delays(self):
         self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = True
         self.tiger.config['RATE_LIMIT_BACKOFF_BASE'] = 1.0
+        self.tiger.config['RATE_LIMIT_BACKOFF_FACTOR'] = 2.0
+        self.tiger.config['RATE_LIMIT_BACKOFF_MAX'] = 60.0
         self.tiger.config['RATE_LIMITS'] = {'default': '1/s'}
-        for _ in range(3):
+        for _ in range(4):
             self.tiger.delay(simple_task)
+        now = time.time()
         Worker(self.tiger).run(once=True)
-        scheduled1 = self.conn.zrange('t:scheduled:default', 0, -1, withscores=True)
-        if scheduled1:
-            first_score = scheduled1[0][1]
-            now = time.time()
-            assert first_score >= now + 0.5
+        scheduled = self.conn.zrange('t:scheduled:default', 0, -1, withscores=True)
+        assert len(scheduled) >= 2
+        delays = sorted([score - now for _, score in scheduled])
+        assert delays[-1] > 3.0
+        for i in range(1, len(delays)):
+            assert delays[i] > delays[i - 1]
 
     def test_rate_limit_slow_task_decorator(self):
         task = Task(self.tiger, rate_limited_slow_task)
@@ -691,3 +751,13 @@ class TestRateLimitIntegration:
     def test_rate_limit_not_in_data_when_none(self):
         task = Task(self.tiger, simple_task)
         assert 'rate_limit' not in task.data
+
+    def test_package_root_import(self):
+        from tasktiger import RateLimitedException as Exc
+        assert issubclass(Exc, Exception)
+        from tasktiger import RateLimitInfo as Info
+        assert Info is RateLimitInfo
+        from tasktiger import RateLimiter as RL
+        assert RL is RateLimiter
+        from tasktiger import parse_rate_limit as prl
+        assert prl is parse_rate_limit

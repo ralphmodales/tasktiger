@@ -495,40 +495,29 @@ class TaskTiger:
             )
         return self._rate_limiter_instance
 
+    def _resolve_rate_limit_config(self, queue: str) -> Tuple[Optional[str], str]:
+        return self.rate_limiter.resolve_queue_config(
+            queue, self.config['RATE_LIMITS']
+        )
+
     def set_queue_rate_limit(self, queue: str, rate_limit: str) -> None:
         self.rate_limiter.set_rate_limit(queue, rate_limit)
 
     def get_rate_limit_status(self, queue: str) -> Optional[Dict]:
         from .rate_limiter import parse_rate_limit as _parse
-
-        rl = self.rate_limiter
-        config_val = rl.get_rate_limit(queue)
-        if config_val is None:
-            from ._internal import reversed_dotted_parts
-            for part in reversed_dotted_parts(queue):
-                if part in self.config['RATE_LIMITS']:
-                    config_val = self.config['RATE_LIMITS'][part]
-                    queue = part
-                    break
+        config_val, effective_queue = self._resolve_rate_limit_config(queue)
         if config_val is None:
             return None
         count, window = _parse(config_val)
-        key = rl._rate_limit_key(queue)
-        return rl.get_status(key, count, window)
+        key = self.rate_limiter._rate_limit_key(effective_queue)
+        return self.rate_limiter.get_status(key, count, window)
 
     def clear_queue_rate_limit(self, queue: str) -> None:
         self.rate_limiter.clear_rate_limit(queue)
 
     def get_queue_rate_limit(self, queue: str) -> Optional[str]:
-        rl = self.rate_limiter
-        val = rl.get_rate_limit(queue)
-        if val is not None:
-            return val
-        from ._internal import reversed_dotted_parts
-        for part in reversed_dotted_parts(queue):
-            if part in self.config['RATE_LIMITS']:
-                return self.config['RATE_LIMITS'][part]
-        return None
+        config_val, _ = self._resolve_rate_limit_config(queue)
+        return config_val
 
     def set_bulk_queue_rate_limits(self, limits: Dict[str, str]) -> None:
         self.rate_limiter.set_bulk_rate_limits(limits)
@@ -540,23 +529,14 @@ class TaskTiger:
         self.rate_limiter.clear_bulk_rate_limits(queues)
 
     def get_rate_limit_detailed_status(self, queue: str) -> Optional[Any]:
-        from .rate_limiter import RateLimitInfo, parse_rate_limit as _parse
-        rl = self.rate_limiter
-        config_val = rl.get_rate_limit(queue)
-        effective_queue = queue
-        if config_val is None:
-            from ._internal import reversed_dotted_parts
-            for part in reversed_dotted_parts(queue):
-                if part in self.config['RATE_LIMITS']:
-                    config_val = self.config['RATE_LIMITS'][part]
-                    effective_queue = part
-                    break
+        from .rate_limiter import parse_rate_limit as _parse
+        config_val, effective_queue = self._resolve_rate_limit_config(queue)
         if config_val is None:
             return None
         count, window = _parse(config_val)
-        key = rl._rate_limit_key(effective_queue)
+        key = self.rate_limiter._rate_limit_key(effective_queue)
         burst = self.config.get('RATE_LIMIT_BURST', {}).get(effective_queue, 0)
-        return rl.get_detailed_status(key, count, window, burst)
+        return self.rate_limiter.get_detailed_status(key, count, window, burst)
 
     def get_queue_rejection_count(self, queue: str, window: float = 3600.0) -> int:
         return self.rate_limiter.get_rejection_count(queue, window)
@@ -566,45 +546,26 @@ class TaskTiger:
 
     def estimate_queue_wait_time(self, queue: str) -> float:
         from .rate_limiter import parse_rate_limit as _parse
-        rl = self.rate_limiter
-        config_val = rl.get_rate_limit(queue)
-        effective_queue = queue
-        if config_val is None:
-            from ._internal import reversed_dotted_parts
-            for part in reversed_dotted_parts(queue):
-                if part in self.config['RATE_LIMITS']:
-                    config_val = self.config['RATE_LIMITS'][part]
-                    effective_queue = part
-                    break
+        config_val, effective_queue = self._resolve_rate_limit_config(queue)
         if config_val is None:
             return 0.0
         count, window = _parse(config_val)
-        key = rl._rate_limit_key(effective_queue)
-        return rl.estimate_wait_time(key, count, window)
+        key = self.rate_limiter._rate_limit_key(effective_queue)
+        return self.rate_limiter.estimate_wait_time(key, count, window)
 
     def peek_queue_rate_limit(self, queue: str) -> bool:
         from .rate_limiter import parse_rate_limit as _parse
-        rl = self.rate_limiter
-        config_val = rl.get_rate_limit(queue)
-        effective_queue = queue
-        if config_val is None:
-            from ._internal import reversed_dotted_parts
-            for part in reversed_dotted_parts(queue):
-                if part in self.config['RATE_LIMITS']:
-                    config_val = self.config['RATE_LIMITS'][part]
-                    effective_queue = part
-                    break
+        config_val, effective_queue = self._resolve_rate_limit_config(queue)
         if config_val is None:
             return True
         count, window = _parse(config_val)
-        key = rl._rate_limit_key(effective_queue)
+        key = self.rate_limiter._rate_limit_key(effective_queue)
         burst = self.config.get('RATE_LIMIT_BURST', {}).get(effective_queue, 0)
-        return rl.peek(key, count + burst, window)
+        return self.rate_limiter.peek(key, count + burst, window)
 
     def reset_queue_rate_limit_window(self, queue: str) -> None:
-        rl = self.rate_limiter
-        key = rl._rate_limit_key(queue)
-        rl.reset_window(key)
+        key = self.rate_limiter._rate_limit_key(queue)
+        self.rate_limiter.reset_window(key)
 
     def get_all_queue_rate_limits(self) -> Dict[str, str]:
         dynamic = self.rate_limiter.get_all_configured_limits()

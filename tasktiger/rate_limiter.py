@@ -4,7 +4,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from redis import Redis
+from redis import Redis, WatchError
 
 from ._internal import reversed_dotted_parts
 
@@ -130,26 +130,32 @@ class RateLimiter:
     def _history_key(self, name: str) -> str:
         return f'{self._key_prefix}:rate_limit_history:{name}'
 
-    def _resolve_queue_rate_limit(
+    def resolve_queue_config(
         self, queue: str, rate_limits_config: Dict[str, str]
-    ) -> Optional[Tuple[str, int, float]]:
+    ) -> Tuple[Optional[str], str]:
         config_val = self._redis.get(self._config_key(queue))
         if config_val:
-            count, window = parse_rate_limit(config_val)
-            return (self._rate_limit_key(queue), count, window)
+            return (config_val, queue)
 
         for part in reversed_dotted_parts(queue):
             config_val = self._redis.get(self._config_key(part))
             if config_val:
-                count, window = parse_rate_limit(config_val)
-                return (self._rate_limit_key(part), count, window)
+                return (config_val, part)
 
         for part in reversed_dotted_parts(queue):
             if part in rate_limits_config:
-                count, window = parse_rate_limit(rate_limits_config[part])
-                return (self._rate_limit_key(part), count, window)
+                return (rate_limits_config[part], part)
 
-        return None
+        return (None, queue)
+
+    def _resolve_queue_rate_limit(
+        self, queue: str, rate_limits_config: Dict[str, str]
+    ) -> Optional[Tuple[str, int, float]]:
+        config_val, effective_queue = self.resolve_queue_config(queue, rate_limits_config)
+        if config_val is None:
+            return None
+        count, window = parse_rate_limit(config_val)
+        return (self._rate_limit_key(effective_queue), count, window)
 
     def _resolve_task_rate_limit(
         self, serialized_func: str, task_rate_limit_str: Optional[str]
@@ -166,33 +172,22 @@ class RateLimiter:
         serialized_func: str,
         task_rate_limit: Optional[str],
         rate_limits_config: Dict[str, str],
+        burst_config: Optional[Dict[str, int]] = None,
     ) -> List[Tuple[str, int, float]]:
         limits: List[Tuple[str, int, float]] = []
 
         queue_limit = self._resolve_queue_rate_limit(queue, rate_limits_config)
         if queue_limit:
-            limits.append(queue_limit)
+            key, count, window = queue_limit
+            if burst_config:
+                count += burst_config.get(queue, 0)
+            limits.append((key, count, window))
 
         task_limit = self._resolve_task_rate_limit(serialized_func, task_rate_limit)
         if task_limit:
             limits.append(task_limit)
 
         return limits
-
-    def _add_entries(self, key: str, now: float, current_count: int, amount: int, window: float) -> None:
-        pipe = self._redis.pipeline(True)
-        for i in range(amount):
-            member = f'{now}:{current_count + i + 1}:{random.randint(0, 999999)}'
-            pipe.zadd(key, {member: now})
-        pipe.expire(key, int(window) + 10)
-        pipe.execute()
-
-    def _clean_and_count(self, key: str, window_start: float) -> int:
-        pipe = self._redis.pipeline(True)
-        pipe.zremrangebyscore(key, 0, window_start)
-        pipe.zcard(key)
-        results = pipe.execute()
-        return results[1]
 
     def _compute_retry_after(self, key: str, window: float, now: float) -> float:
         oldest = self._redis.zrange(key, 0, 0, withscores=True)
@@ -205,16 +200,7 @@ class RateLimiter:
     def consume(
         self, key: str, count: int, window: float, amount: int = 1
     ) -> Tuple[bool, float]:
-        now = time.time()
-        window_start = now - window
-        current_count = self._clean_and_count(key, window_start)
-
-        if current_count + amount > count:
-            retry_after = self._compute_retry_after(key, window, now)
-            return (False, retry_after)
-
-        self._add_entries(key, now, current_count, amount, window)
-        return (True, 0.0)
+        return self.consume_multi([(key, count, window)], amount)
 
     def consume_with_burst(
         self,
@@ -224,17 +210,63 @@ class RateLimiter:
         burst: int,
         amount: int = 1,
     ) -> Tuple[bool, float]:
-        effective_count = count + burst
-        now = time.time()
-        window_start = now - window
-        current_count = self._clean_and_count(key, window_start)
+        return self.consume_multi([(key, count + burst, window)], amount)
 
-        if current_count + amount > effective_count:
-            retry_after = self._compute_retry_after(key, window, now)
-            return (False, retry_after)
+    def consume_multi(
+        self, limits: List[Tuple[str, int, float]], amount: int = 1
+    ) -> Tuple[bool, float]:
+        if not limits:
+            return (True, 0.0)
 
-        self._add_entries(key, now, current_count, amount, window)
-        return (True, 0.0)
+        keys = [key for key, _, _ in limits]
+
+        for _ in range(5):
+            now = time.time()
+
+            clean_pipe = self._redis.pipeline(False)
+            for key, _, window in limits:
+                clean_pipe.zremrangebyscore(key, 0, now - window)
+            clean_pipe.execute()
+
+            try:
+                pipe = self._redis.pipeline(True)
+                pipe.watch(*keys)
+
+                counts = {}
+                for key, _, _ in limits:
+                    counts[key] = pipe.zcard(key)
+
+                max_retry_after = 0.0
+                all_allowed = True
+                for key, count, window in limits:
+                    if counts[key] + amount > count:
+                        all_allowed = False
+                        oldest = pipe.zrange(key, 0, 0, withscores=True)
+                        if oldest:
+                            oldest_score = oldest[0][1]
+                            max_retry_after = max(
+                                max_retry_after,
+                                max(0.0, oldest_score + window - now),
+                            )
+                        break
+
+                if not all_allowed:
+                    pipe.unwatch()
+                    return (False, max_retry_after)
+
+                pipe.multi()
+                for key, count, window in limits:
+                    for i in range(amount):
+                        member = f'{now}:{counts[key] + i + 1}:{random.randint(0, 999999)}'
+                        pipe.zadd(key, {member: now})
+                    pipe.expire(key, int(window) + 10)
+                pipe.execute()
+                return (True, 0.0)
+
+            except WatchError:
+                continue
+
+        return (False, 0.0)
 
     def get_status(self, key: str, count: int, window: float) -> Dict[str, Any]:
         now = time.time()
@@ -282,17 +314,13 @@ class RateLimiter:
         return val
 
     def clear_rate_limit(self, name: str) -> None:
-        pipe = self._redis.pipeline(True)
-        pipe.delete(self._config_key(name))
-        pipe.delete(self._rate_limit_key(name))
-        pipe.delete(self._penalty_key(name))
-        pipe.delete(self._history_key(name))
-        pipe.execute()
+        self._redis.delete(self._config_key(name))
 
     def set_bulk_rate_limits(self, limits: Dict[str, str]) -> None:
+        for rate_limit_str in limits.values():
+            parse_rate_limit(rate_limit_str)
         pipe = self._redis.pipeline(True)
         for name, rate_limit_str in limits.items():
-            parse_rate_limit(rate_limit_str)
             pipe.set(self._config_key(name), rate_limit_str)
         pipe.execute()
 
@@ -307,9 +335,6 @@ class RateLimiter:
         pipe = self._redis.pipeline(True)
         for name in names:
             pipe.delete(self._config_key(name))
-            pipe.delete(self._rate_limit_key(name))
-            pipe.delete(self._penalty_key(name))
-            pipe.delete(self._history_key(name))
         pipe.execute()
 
     def record_penalty(self, name: str, ttl: int = 300) -> int:
@@ -374,7 +399,11 @@ class RateLimiter:
     def peek(self, key: str, count: int, window: float, amount: int = 1) -> bool:
         now = time.time()
         window_start = now - window
-        current = self._clean_and_count(key, window_start)
+        pipe = self._redis.pipeline(True)
+        pipe.zremrangebyscore(key, 0, window_start)
+        pipe.zcard(key)
+        results = pipe.execute()
+        current = results[1]
         return current + amount <= count
 
     def reset_window(self, key: str) -> None:
