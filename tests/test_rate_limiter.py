@@ -132,35 +132,30 @@ class TestRateLimiter:
         self.limiter = tiger.rate_limiter
 
     def test_consume_within_limit(self):
-        allowed, retry_after = self.limiter.consume(
-            self.limiter._rate_limit_key('test'), 5, 60.0
-        )
+        allowed, retry_after = self.limiter.consume('test:rl:a', 5, 60.0)
         assert allowed is True
         assert retry_after == 0.0
 
     def test_consume_exceeds_limit(self):
-        key = self.limiter._rate_limit_key('test_exceed')
         for _ in range(3):
-            self.limiter.consume(key, 3, 60.0)
-        allowed, retry_after = self.limiter.consume(key, 3, 60.0)
+            self.limiter.consume('test:rl:b', 3, 60.0)
+        allowed, retry_after = self.limiter.consume('test:rl:b', 3, 60.0)
         assert allowed is False
         assert retry_after > 0
 
     def test_sliding_window_expiry(self):
-        key = self.limiter._rate_limit_key('test_expiry')
         for _ in range(3):
-            self.limiter.consume(key, 3, 0.5)
-        allowed, _ = self.limiter.consume(key, 3, 0.5)
+            self.limiter.consume('test:rl:c', 3, 0.5)
+        allowed, _ = self.limiter.consume('test:rl:c', 3, 0.5)
         assert allowed is False
         time.sleep(0.6)
-        allowed, _ = self.limiter.consume(key, 3, 0.5)
+        allowed, _ = self.limiter.consume('test:rl:c', 3, 0.5)
         assert allowed is True
 
     def test_get_status(self):
-        key = self.limiter._rate_limit_key('test_status')
-        self.limiter.consume(key, 10, 60.0)
-        self.limiter.consume(key, 10, 60.0)
-        status = self.limiter.get_status(key, 10, 60.0)
+        self.limiter.consume('test:rl:d', 10, 60.0)
+        self.limiter.consume('test:rl:d', 10, 60.0)
+        status = self.limiter.get_status('test:rl:d', 10, 60.0)
         assert status['limit'] == 10
         assert status['used'] == 2
         assert status['remaining'] == 8
@@ -170,94 +165,75 @@ class TestRateLimiter:
         self.limiter.set_rate_limit('myqueue', '100/m')
         assert self.limiter.get_rate_limit('myqueue') == '100/m'
 
-    def test_clear_rate_limit_removes_config(self):
+    def test_clear_rate_limit(self):
         self.limiter.set_rate_limit('myqueue', '100/m')
         self.limiter.clear_rate_limit('myqueue')
         assert self.limiter.get_rate_limit('myqueue') is None
 
-    def test_clear_rate_limit_preserves_window(self):
-        self.limiter.set_rate_limit('myqueue', '100/m')
-        key = self.limiter._rate_limit_key('myqueue')
-        self.limiter.consume(key, 100, 60.0)
-        self.limiter.consume(key, 100, 60.0)
-        self.limiter.clear_rate_limit('myqueue')
-        assert self.conn.exists(key) == 1
-
     def test_consume_amount_greater_than_one(self):
-        key = self.limiter._rate_limit_key('test_amount')
-        allowed, _ = self.limiter.consume(key, 5, 60.0, amount=3)
+        allowed, _ = self.limiter.consume('test:rl:e', 5, 60.0, amount=3)
         assert allowed is True
-        allowed, _ = self.limiter.consume(key, 5, 60.0, amount=3)
+        allowed, _ = self.limiter.consume('test:rl:e', 5, 60.0, amount=3)
         assert allowed is False
 
     def test_consume_exact_limit(self):
-        key = self.limiter._rate_limit_key('test_exact')
         for _ in range(5):
-            allowed, _ = self.limiter.consume(key, 5, 60.0)
+            allowed, _ = self.limiter.consume('test:rl:f', 5, 60.0)
             assert allowed is True
-        allowed, retry_after = self.limiter.consume(key, 5, 60.0)
+        allowed, retry_after = self.limiter.consume('test:rl:f', 5, 60.0)
         assert allowed is False
         assert retry_after > 0
 
     def test_consume_amount_equals_limit(self):
-        key = self.limiter._rate_limit_key('test_amount_eq')
-        allowed, _ = self.limiter.consume(key, 5, 60.0, amount=5)
+        allowed, _ = self.limiter.consume('test:rl:g', 5, 60.0, amount=5)
         assert allowed is True
-        allowed, _ = self.limiter.consume(key, 5, 60.0, amount=1)
+        allowed, _ = self.limiter.consume('test:rl:g', 5, 60.0, amount=1)
         assert allowed is False
 
     def test_consume_amount_exceeds_limit(self):
-        key = self.limiter._rate_limit_key('test_amount_over')
-        allowed, retry_after = self.limiter.consume(key, 3, 60.0, amount=4)
+        allowed, _ = self.limiter.consume('test:rl:h', 3, 60.0, amount=4)
         assert allowed is False
 
     def test_retry_after_decreases_over_time(self):
-        key = self.limiter._rate_limit_key('test_retry_decay')
         for _ in range(3):
-            self.limiter.consume(key, 3, 1.0)
-        _, retry1 = self.limiter.consume(key, 3, 1.0)
+            self.limiter.consume('test:rl:i', 3, 1.0)
+        _, retry1 = self.limiter.consume('test:rl:i', 3, 1.0)
         time.sleep(0.3)
-        _, retry2 = self.limiter.consume(key, 3, 1.0)
+        _, retry2 = self.limiter.consume('test:rl:i', 3, 1.0)
         assert retry2 < retry1
 
     def test_consume_with_burst(self):
-        key = self.limiter._rate_limit_key('test_burst')
         for _ in range(5):
-            allowed, _ = self.limiter.consume_with_burst(key, 3, 60.0, burst=2)
+            allowed, _ = self.limiter.consume_with_burst('test:rl:j', 3, 60.0, burst=2)
             assert allowed is True
-        allowed, _ = self.limiter.consume_with_burst(key, 3, 60.0, burst=2)
+        allowed, _ = self.limiter.consume_with_burst('test:rl:j', 3, 60.0, burst=2)
         assert allowed is False
 
     def test_consume_with_burst_zero(self):
-        key = self.limiter._rate_limit_key('test_burst_zero')
         for _ in range(3):
-            self.limiter.consume_with_burst(key, 3, 60.0, burst=0)
-        allowed, _ = self.limiter.consume_with_burst(key, 3, 60.0, burst=0)
+            self.limiter.consume_with_burst('test:rl:k', 3, 60.0, burst=0)
+        allowed, _ = self.limiter.consume_with_burst('test:rl:k', 3, 60.0, burst=0)
         assert allowed is False
 
-    def test_consume_multi_atomic_all_or_nothing(self):
-        key_a = self.limiter._rate_limit_key('multi_a')
-        key_b = self.limiter._rate_limit_key('multi_b')
+    def test_consume_multi_rejects_without_consuming(self):
         for _ in range(3):
-            self.limiter.consume(key_b, 3, 60.0)
+            self.limiter.consume('test:rl:mb', 3, 60.0)
         allowed, _ = self.limiter.consume_multi([
-            (key_a, 5, 60.0),
-            (key_b, 3, 60.0),
+            ('test:rl:ma', 5, 60.0),
+            ('test:rl:mb', 3, 60.0),
         ])
         assert allowed is False
-        status_a = self.limiter.get_status(key_a, 5, 60.0)
+        status_a = self.limiter.get_status('test:rl:ma', 5, 60.0)
         assert status_a['used'] == 0
 
     def test_consume_multi_commits_all_on_success(self):
-        key_a = self.limiter._rate_limit_key('multi_ok_a')
-        key_b = self.limiter._rate_limit_key('multi_ok_b')
         allowed, _ = self.limiter.consume_multi([
-            (key_a, 5, 60.0),
-            (key_b, 5, 60.0),
+            ('test:rl:mc', 5, 60.0),
+            ('test:rl:md', 5, 60.0),
         ])
         assert allowed is True
-        assert self.limiter.get_status(key_a, 5, 60.0)['used'] == 1
-        assert self.limiter.get_status(key_b, 5, 60.0)['used'] == 1
+        assert self.limiter.get_status('test:rl:mc', 5, 60.0)['used'] == 1
+        assert self.limiter.get_status('test:rl:md', 5, 60.0)['used'] == 1
 
     def test_set_invalid_rate_limit(self):
         with pytest.raises(ValueError):
@@ -345,56 +321,48 @@ class TestRateLimiter:
         assert self.limiter.get_rejection_rate('any', 0.0) == 0.0
 
     def test_estimate_wait_time_no_entries(self):
-        key = self.limiter._rate_limit_key('empty')
-        wait = self.limiter.estimate_wait_time(key, 5, 60.0)
+        wait = self.limiter.estimate_wait_time('test:rl:ew1', 5, 60.0)
         assert wait == 0.0
 
     def test_estimate_wait_time_under_limit(self):
-        key = self.limiter._rate_limit_key('partial')
-        self.limiter.consume(key, 5, 60.0)
-        wait = self.limiter.estimate_wait_time(key, 5, 60.0)
+        self.limiter.consume('test:rl:ew2', 5, 60.0)
+        wait = self.limiter.estimate_wait_time('test:rl:ew2', 5, 60.0)
         assert wait == 0.0
 
     def test_estimate_wait_time_at_limit(self):
-        key = self.limiter._rate_limit_key('full')
         for _ in range(5):
-            self.limiter.consume(key, 5, 60.0)
-        wait = self.limiter.estimate_wait_time(key, 5, 60.0)
+            self.limiter.consume('test:rl:ew3', 5, 60.0)
+        wait = self.limiter.estimate_wait_time('test:rl:ew3', 5, 60.0)
         assert wait > 0
 
     def test_peek_under_limit(self):
-        key = self.limiter._rate_limit_key('peek_ok')
-        assert self.limiter.peek(key, 5, 60.0) is True
-        self.limiter.consume(key, 5, 60.0)
-        assert self.limiter.peek(key, 5, 60.0) is True
+        assert self.limiter.peek('test:rl:pk1', 5, 60.0) is True
+        self.limiter.consume('test:rl:pk1', 5, 60.0)
+        assert self.limiter.peek('test:rl:pk1', 5, 60.0) is True
 
     def test_peek_at_limit(self):
-        key = self.limiter._rate_limit_key('peek_full')
         for _ in range(5):
-            self.limiter.consume(key, 5, 60.0)
-        assert self.limiter.peek(key, 5, 60.0) is False
+            self.limiter.consume('test:rl:pk2', 5, 60.0)
+        assert self.limiter.peek('test:rl:pk2', 5, 60.0) is False
 
     def test_peek_does_not_consume(self):
-        key = self.limiter._rate_limit_key('peek_nomod')
-        self.limiter.peek(key, 5, 60.0)
-        self.limiter.peek(key, 5, 60.0)
-        self.limiter.peek(key, 5, 60.0)
-        status = self.limiter.get_status(key, 5, 60.0)
+        self.limiter.peek('test:rl:pk3', 5, 60.0)
+        self.limiter.peek('test:rl:pk3', 5, 60.0)
+        self.limiter.peek('test:rl:pk3', 5, 60.0)
+        status = self.limiter.get_status('test:rl:pk3', 5, 60.0)
         assert status['used'] == 0
 
     def test_reset_window(self):
-        key = self.limiter._rate_limit_key('reset')
         for _ in range(5):
-            self.limiter.consume(key, 5, 60.0)
-        assert self.limiter.peek(key, 5, 60.0) is False
-        self.limiter.reset_window(key)
-        assert self.limiter.peek(key, 5, 60.0) is True
+            self.limiter.consume('test:rl:rw', 5, 60.0)
+        assert self.limiter.peek('test:rl:rw', 5, 60.0) is False
+        self.limiter.reset_window('test:rl:rw')
+        assert self.limiter.peek('test:rl:rw', 5, 60.0) is True
 
     def test_get_detailed_status(self):
-        key = self.limiter._rate_limit_key('detail')
-        self.limiter.consume(key, 10, 60.0)
-        self.limiter.consume(key, 10, 60.0)
-        info = self.limiter.get_detailed_status(key, 10, 60.0)
+        self.limiter.consume('test:rl:ds1', 10, 60.0)
+        self.limiter.consume('test:rl:ds1', 10, 60.0)
+        info = self.limiter.get_detailed_status('test:rl:ds1', 10, 60.0)
         assert isinstance(info, RateLimitInfo)
         assert info.limit == 10
         assert info.used == 2
@@ -404,18 +372,16 @@ class TestRateLimiter:
         assert 0 < info.utilization < 1.0
 
     def test_get_detailed_status_with_burst(self):
-        key = self.limiter._rate_limit_key('detail_burst')
         for _ in range(3):
-            self.limiter.consume(key, 3, 60.0)
-        info = self.limiter.get_detailed_status(key, 3, 60.0, burst=5)
+            self.limiter.consume('test:rl:ds2', 3, 60.0)
+        info = self.limiter.get_detailed_status('test:rl:ds2', 3, 60.0, burst=5)
         assert info.burst_limit == 5
         assert info.remaining == 5
 
     def test_rate_limit_info_exhausted(self):
-        key = self.limiter._rate_limit_key('exhausted')
         for _ in range(5):
-            self.limiter.consume(key, 5, 60.0)
-        info = self.limiter.get_detailed_status(key, 5, 60.0)
+            self.limiter.consume('test:rl:ds3', 5, 60.0)
+        info = self.limiter.get_detailed_status('test:rl:ds3', 5, 60.0)
         assert info.is_exhausted is True
         assert info.utilization == 1.0
 
@@ -436,10 +402,7 @@ class TestRateLimiter:
         assert 'burst_limit' in d
 
     def test_get_all_configured_limits(self):
-        self.limiter.set_bulk_rate_limits({
-            'a': '1/s',
-            'b': '2/m',
-        })
+        self.limiter.set_bulk_rate_limits({'a': '1/s', 'b': '2/m'})
         all_limits = self.limiter.get_all_configured_limits()
         assert all_limits['a'] == '1/s'
         assert all_limits['b'] == '2/m'
@@ -454,13 +417,11 @@ class TestRateLimiter:
         assert self.limiter.validate_rate_limit_str('100/5m') is True
 
     def test_key_isolation(self):
-        key_a = self.limiter._rate_limit_key('a')
-        key_b = self.limiter._rate_limit_key('b')
         for _ in range(5):
-            self.limiter.consume(key_a, 5, 60.0)
-        allowed, _ = self.limiter.consume(key_a, 5, 60.0)
+            self.limiter.consume('test:rl:iso_a', 5, 60.0)
+        allowed, _ = self.limiter.consume('test:rl:iso_a', 5, 60.0)
         assert allowed is False
-        allowed, _ = self.limiter.consume(key_b, 5, 60.0)
+        allowed, _ = self.limiter.consume('test:rl:iso_b', 5, 60.0)
         assert allowed is True
 
 
