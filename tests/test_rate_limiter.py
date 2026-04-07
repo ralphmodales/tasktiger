@@ -441,12 +441,19 @@ class TestRateLimitIntegration:
         self.tiger.config['RATE_LIMIT_BACKOFF_BASE'] = 1.0
         self.tiger.config['RATE_LIMIT_BACKOFF_FACTOR'] = 2.0
         self.tiger.config['RATE_LIMIT_BACKOFF_MAX'] = 60.0
-        self.tiger.config['RATE_LIMITS'] = {'default': '1/s'}
+        self.tiger.set_queue_rate_limit('default', '1/s')
         for _ in range(4):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
         rejections = self.tiger.get_queue_rejection_count('default', 60.0)
         assert rejections >= 2
+        self.tiger.clear_queue_rate_limit('default')
+        self.tiger.set_queue_rate_limit('default', '1/s')
+        for _ in range(4):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        rejections_after = self.tiger.get_queue_rejection_count('default', 60.0)
+        assert rejections_after > rejections
         wait = self.tiger.estimate_queue_wait_time('default')
         assert wait > 0
 
