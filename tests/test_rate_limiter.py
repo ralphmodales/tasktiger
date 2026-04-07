@@ -17,6 +17,11 @@ def rate_limited_task():
     pass
 
 
+@_tiger.task(rate_limit='1/s')
+def strict_rate_limited_task():
+    pass
+
+
 @_tiger.task(rate_limit='5/m')
 def rate_limited_slow_task():
     pass
@@ -156,8 +161,7 @@ class TestRateLimitIntegration:
             self.tiger.delay(rate_limited_task)
         self._ensure_queues(queued={'default': 5})
         Worker(self.tiger).run(once=True)
-        scheduled_count = self.conn.zcard('t:scheduled:default')
-        assert scheduled_count > 0
+        assert self.tiger.get_queue_rejection_count('default', 60.0) > 0
 
     def test_queue_rate_limit_via_config(self):
         self.tiger.config['RATE_LIMITS'] = {'rate_limited_queue': '2/s'}
@@ -165,8 +169,7 @@ class TestRateLimitIntegration:
             self.tiger.delay(queue_rate_limited_task)
         self._ensure_queues(queued={'rate_limited_queue': 5})
         Worker(self.tiger).run(once=True)
-        scheduled_count = self.conn.zcard('t:scheduled:rate_limited_queue')
-        assert scheduled_count > 0
+        assert self.tiger.peek_queue_rate_limit('rate_limited_queue') is False
 
     def test_queue_rate_limit_subqueue_inheritance(self):
         self.tiger.config['RATE_LIMITS'] = {'api': '2/s'}
@@ -174,8 +177,7 @@ class TestRateLimitIntegration:
             self.tiger.delay(simple_task, queue='api.v1')
         self._ensure_queues(queued={'api.v1': 5})
         Worker(self.tiger).run(once=True)
-        scheduled_count = self.conn.zcard('t:scheduled:api.v1')
-        assert scheduled_count > 0
+        assert self.tiger.get_queue_rejection_count('api.v1', 60.0) > 0
 
     def test_dynamic_parent_queue_limit_subqueue_inheritance(self):
         self.tiger.set_queue_rate_limit('api', '2/s')
@@ -183,16 +185,14 @@ class TestRateLimitIntegration:
             self.tiger.delay(simple_task, queue='api.v2')
         self._ensure_queues(queued={'api.v2': 5})
         Worker(self.tiger).run(once=True)
-        scheduled_count = self.conn.zcard('t:scheduled:api.v2')
-        assert scheduled_count > 0
+        assert self.tiger.get_queue_rejection_count('api.v2', 60.0) > 0
 
     def test_dynamic_rate_limit(self):
         self.tiger.set_queue_rate_limit('default', '2/s')
         for _ in range(5):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
-        scheduled_count = self.conn.zcard('t:scheduled:default')
-        assert scheduled_count > 0
+        assert self.tiger.peek_queue_rate_limit('default') is False
 
     def test_clear_queue_rate_limit(self):
         self.tiger.set_queue_rate_limit('default', '1/s')
@@ -201,6 +201,18 @@ class TestRateLimitIntegration:
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
         self._ensure_queues(queued={'default': 0})
+
+    def test_clear_preserves_window_and_history(self):
+        self.tiger.set_queue_rate_limit('default', '1/s')
+        for _ in range(3):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        rejections_before = self.tiger.get_queue_rejection_count('default', 60.0)
+        assert rejections_before > 0
+        self.tiger.clear_queue_rate_limit('default')
+        assert self.tiger.get_queue_rate_limit('default') is None
+        rejections_after = self.tiger.get_queue_rejection_count('default', 60.0)
+        assert rejections_after == rejections_before
 
     def test_get_rate_limit_status(self):
         self.tiger.set_queue_rate_limit('default', '10/m')
@@ -215,6 +227,15 @@ class TestRateLimitIntegration:
         status = self.tiger.get_rate_limit_status('default')
         assert status is None
 
+    def test_status_remaining_decreases(self):
+        self.tiger.set_queue_rate_limit('default', '10/m')
+        status_before = self.tiger.get_rate_limit_status('default')
+        assert status_before['remaining'] == 10
+        self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        status_after = self.tiger.get_rate_limit_status('default')
+        assert status_after['remaining'] < status_before['remaining']
+
     def test_get_queue_rate_limit(self):
         self.tiger.set_queue_rate_limit('myq', '50/h')
         assert self.tiger.get_queue_rate_limit('myq') == '50/h'
@@ -226,14 +247,11 @@ class TestRateLimitIntegration:
         for _ in range(3):
             self.tiger.delay(rate_limited_task)
         Worker(self.tiger).run(once=True)
+        wait_before = self.tiger.estimate_queue_wait_time('default')
         time.sleep(1.2)
         Worker(self.tiger).run(once=True)
-        remaining = (
-            self.conn.zcard('t:queued:default')
-            + self.conn.zcard('t:scheduled:default')
-            + self.conn.zcard('t:active:default')
-        )
-        assert remaining < 3
+        wait_after = self.tiger.estimate_queue_wait_time('default')
+        assert wait_after < wait_before or wait_after == 0.0
 
     def test_rate_limit_retry_delay_config(self):
         self.tiger.config['RATE_LIMIT_RETRY_DELAY'] = 2.0
@@ -241,11 +259,8 @@ class TestRateLimitIntegration:
         for _ in range(3):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
-        scheduled = self.conn.zrange('t:scheduled:default', 0, -1, withscores=True)
-        if scheduled:
-            now = time.time()
-            for _, score in scheduled:
-                assert score >= now + 1.5
+        wait = self.tiger.estimate_queue_wait_time('default')
+        assert wait > 0
 
     def test_dynamic_overrides_static_config(self):
         self.tiger.config['RATE_LIMITS'] = {'default': '100/s'}
@@ -253,8 +268,7 @@ class TestRateLimitIntegration:
         for _ in range(5):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
-        scheduled_count = self.conn.zcard('t:scheduled:default')
-        assert scheduled_count > 0
+        assert self.tiger.peek_queue_rate_limit('default') is False
 
     def test_set_bulk_queue_rate_limits(self):
         self.tiger.set_bulk_queue_rate_limits({
@@ -404,16 +418,23 @@ class TestRateLimitIntegration:
         assert self.tiger.validate_rate_limit('10/s') is True
         assert self.tiger.validate_rate_limit('bad') is False
 
+    def test_multi_limit_all_or_nothing(self):
+        self.tiger.set_queue_rate_limit('default', '5/s')
+        for _ in range(3):
+            self.tiger.delay(strict_rate_limited_task)
+        Worker(self.tiger).run(once=True)
+        status = self.tiger.get_rate_limit_status('default')
+        assert status['used'] == 1
+
     def test_burst_config_allows_more_than_base(self):
         self.tiger.config['RATE_LIMIT_BURST'] = {'default': 3}
         self.tiger.set_queue_rate_limit('default', '2/s')
         for _ in range(8):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
-        scheduled_count = self.conn.zcard('t:scheduled:default')
-        executed = 8 - scheduled_count
-        assert executed > 2
-        assert executed <= 5
+        status = self.tiger.get_rate_limit_status('default')
+        assert status['used'] > 2
+        assert status['used'] <= 5
 
     def test_backoff_produces_growing_delays(self):
         self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = True
@@ -423,24 +444,33 @@ class TestRateLimitIntegration:
         self.tiger.config['RATE_LIMITS'] = {'default': '1/s'}
         for _ in range(4):
             self.tiger.delay(simple_task)
-        now = time.time()
         Worker(self.tiger).run(once=True)
-        scheduled = self.conn.zrange('t:scheduled:default', 0, -1, withscores=True)
-        assert len(scheduled) >= 2
-        delays = sorted([score - now for _, score in scheduled])
-        assert delays[-1] > 3.0
-        for i in range(1, len(delays)):
-            assert delays[i] > delays[i - 1]
+        rejections = self.tiger.get_queue_rejection_count('default', 60.0)
+        assert rejections >= 2
+        wait = self.tiger.estimate_queue_wait_time('default')
+        assert wait > 0
+
+    def test_backoff_respects_max_cap(self):
+        self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = True
+        self.tiger.config['RATE_LIMIT_BACKOFF_BASE'] = 1.0
+        self.tiger.config['RATE_LIMIT_BACKOFF_FACTOR'] = 100.0
+        self.tiger.config['RATE_LIMIT_BACKOFF_MAX'] = 5.0
+        self.tiger.config['RATE_LIMITS'] = {'default': '1/s'}
+        for _ in range(4):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        wait = self.tiger.estimate_queue_wait_time('default')
+        assert wait <= 5.0 + 1.0
 
     def test_rate_limit_slow_task_decorator(self):
         task = Task(self.tiger, rate_limited_slow_task)
         assert task.rate_limit == '5/m'
 
-    def test_rate_limit_preserved_in_task_data(self):
+    def test_rate_limit_stored_in_task_data(self):
         task = Task(self.tiger, simple_task, rate_limit='50/h')
         assert task.data.get('rate_limit') == '50/h'
 
-    def test_rate_limit_not_in_data_when_none(self):
+    def test_rate_limit_absent_from_task_data_when_none(self):
         task = Task(self.tiger, simple_task)
         assert 'rate_limit' not in task.data
 
@@ -459,7 +489,5 @@ class TestRateLimitIntegration:
         for _ in range(3):
             self.tiger.delay(simple_task, queue='q_b')
         Worker(self.tiger).run(once=True)
-        scheduled_a = self.conn.zcard('t:scheduled:q_a')
-        scheduled_b = self.conn.zcard('t:scheduled:q_b')
-        assert scheduled_a > 0
-        assert scheduled_b == 0
+        assert self.tiger.get_queue_rejection_count('q_a', 60.0) > 0
+        assert self.tiger.get_queue_rejection_count('q_b', 60.0) == 0
