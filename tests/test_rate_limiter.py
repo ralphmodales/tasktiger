@@ -498,3 +498,94 @@ class TestRateLimitIntegration:
         Worker(self.tiger).run(once=True)
         assert self.tiger.get_queue_rejection_count('q_a', 60.0) > 0
         assert self.tiger.get_queue_rejection_count('q_b', 60.0) == 0
+
+    def test_set_queue_rate_limit_validates_input(self):
+        with pytest.raises(ValueError):
+            self.tiger.set_queue_rate_limit('default', 'garbage')
+        with pytest.raises(ValueError):
+            self.tiger.set_queue_rate_limit('default', '0/s')
+
+    def test_delay_rate_limit_overrides_decorator(self):
+        task = self.tiger.delay(rate_limited_task, rate_limit='100/m')
+        assert task.rate_limit == '100/m'
+
+    def test_peek_subqueue_inherits_parent_limit(self):
+        self.tiger.set_queue_rate_limit('svc', '1/s')
+        for _ in range(3):
+            self.tiger.delay(simple_task, queue='svc.endpoint')
+        Worker(self.tiger).run(once=True)
+        assert self.tiger.peek_queue_rate_limit('svc.endpoint') is False
+
+    def test_status_remaining_equals_limit_minus_used(self):
+        self.tiger.set_queue_rate_limit('default', '10/m')
+        self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        status = self.tiger.get_rate_limit_status('default')
+        assert status['remaining'] == status['limit'] - status['used']
+
+    def test_rate_limit_info_repr(self):
+        self.tiger.set_queue_rate_limit('default', '10/m')
+        self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        info = self.tiger.get_rate_limit_detailed_status('default')
+        r = repr(info)
+        assert 'limit' in r
+        assert 'used' in r
+
+    def test_tasks_without_rate_limit_unaffected(self):
+        self.tiger.config['RATE_LIMITS'] = {}
+        for _ in range(5):
+            self.tiger.delay(simple_task)
+        self._ensure_queues(queued={'default': 5})
+        Worker(self.tiger).run(once=True)
+        self._ensure_queues(queued={'default': 0})
+
+    def test_backoff_disabled_by_default(self):
+        self.tiger.set_queue_rate_limit('default', '1/s')
+        for _ in range(4):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        rejections = self.tiger.get_queue_rejection_count('default', 60.0)
+        assert rejections >= 2
+        self.tiger.clear_queue_rate_limit('default')
+        self.tiger.set_queue_rate_limit('default', '1/s')
+        for _ in range(4):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        rejections_second = self.tiger.get_queue_rejection_count('default', 60.0)
+        assert rejections_second > rejections
+
+    def test_estimate_wait_time_subqueue_inherits(self):
+        self.tiger.set_queue_rate_limit('parent', '1/s')
+        for _ in range(3):
+            self.tiger.delay(simple_task, queue='parent.child')
+        Worker(self.tiger).run(once=True)
+        wait = self.tiger.estimate_queue_wait_time('parent.child')
+        assert wait > 0
+
+    def test_validate_rate_limit_edge_cases(self):
+        assert self.tiger.validate_rate_limit('1/s') is True
+        assert self.tiger.validate_rate_limit('999/30s') is True
+        assert self.tiger.validate_rate_limit('10/d') is True
+        assert self.tiger.validate_rate_limit('') is False
+        assert self.tiger.validate_rate_limit('0/s') is False
+        assert self.tiger.validate_rate_limit('abc') is False
+        assert self.tiger.validate_rate_limit('10/x') is False
+
+    def test_get_all_queue_rate_limits_empty(self):
+        self.tiger.config['RATE_LIMITS'] = {}
+        result = self.tiger.get_all_queue_rate_limits()
+        assert result == {}
+
+    def test_burst_does_not_affect_other_queues(self):
+        self.tiger.config['RATE_LIMIT_BURST'] = {'burst_q': 10}
+        self.tiger.set_queue_rate_limit('burst_q', '2/s')
+        self.tiger.set_queue_rate_limit('normal_q', '2/s')
+        for _ in range(5):
+            self.tiger.delay(simple_task, queue='burst_q')
+        for _ in range(5):
+            self.tiger.delay(simple_task, queue='normal_q')
+        Worker(self.tiger).run(once=True)
+        status_burst = self.tiger.get_rate_limit_status('burst_q')
+        status_normal = self.tiger.get_rate_limit_status('normal_q')
+        assert status_burst['used'] > status_normal['used']
