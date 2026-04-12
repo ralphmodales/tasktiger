@@ -8,3 +8,5 @@ dist/
 .idea/
 venv/
 .python-version
+dump.rdb
+test_results.xml

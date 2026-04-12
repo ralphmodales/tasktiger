@@ -550,8 +550,9 @@ class TaskTiger:
         if config_val is None:
             return 0.0
         count, window = _parse(config_val)
+        burst = self.config.get('RATE_LIMIT_BURST', {}).get(effective_queue, 0)
         key = self.rate_limiter._rate_limit_key(effective_queue)
-        return self.rate_limiter.estimate_wait_time(key, count, window)
+        return self.rate_limiter.estimate_wait_time(key, count + burst, window)
 
     def peek_queue_rate_limit(self, queue: str) -> bool:
         from .rate_limiter import parse_rate_limit as _parse
@@ -564,7 +565,8 @@ class TaskTiger:
         return self.rate_limiter.peek(key, count + burst, window)
 
     def reset_queue_rate_limit_window(self, queue: str) -> None:
-        key = self.rate_limiter._rate_limit_key(queue)
+        _, effective_queue = self._resolve_rate_limit_config(queue)
+        key = self.rate_limiter._rate_limit_key(effective_queue)
         self.rate_limiter.reset_window(key)
 
     def get_all_queue_rate_limits(self) -> Dict[str, str]:

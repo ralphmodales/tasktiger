@@ -56,6 +56,8 @@ def format_rate_limit(count: int, window: float) -> str:
         return f'{count}/d'
     if window == int(window):
         iw = int(window)
+        if iw % 86400 == 0:
+            return f'{count}/{iw // 86400}d'
         if iw % 3600 == 0:
             return f'{count}/{iw // 3600}h'
         if iw % 60 == 0:

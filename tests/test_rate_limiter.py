@@ -589,3 +589,144 @@ class TestRateLimitIntegration:
         status_burst = self.tiger.get_rate_limit_status('burst_q')
         status_normal = self.tiger.get_rate_limit_status('normal_q')
         assert status_burst['used'] > status_normal['used']
+
+    def test_sliding_window_not_fixed_window(self):
+        self.tiger.set_queue_rate_limit('default', '3/s')
+        for _ in range(3):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        self._ensure_queues(queued={'default': 0})
+        status = self.tiger.get_rate_limit_status('default')
+        assert status['used'] == 3
+        assert status['remaining'] == 0
+        time.sleep(0.6)
+        for _ in range(3):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        status_mid = self.tiger.get_rate_limit_status('default')
+        assert status_mid is not None
+        assert status_mid['used'] > 0
+        time.sleep(0.6)
+        status_after = self.tiger.get_rate_limit_status('default')
+        assert status_after['remaining'] > status['remaining']
+
+    def test_sliding_window_partial_expiry(self):
+        self.tiger.set_queue_rate_limit('default', '4/s')
+        for _ in range(4):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        assert self.tiger.peek_queue_rate_limit('default') is False
+        time.sleep(0.5)
+        self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        time.sleep(0.6)
+        assert self.tiger.peek_queue_rate_limit('default') is True
+        status = self.tiger.get_rate_limit_status('default')
+        assert status['remaining'] > 0
+
+    def test_sliding_window_wait_time_decreases_over_time(self):
+        self.tiger.set_queue_rate_limit('default', '2/s')
+        for _ in range(4):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        wait_t0 = self.tiger.estimate_queue_wait_time('default')
+        assert wait_t0 > 0
+        time.sleep(0.5)
+        wait_t1 = self.tiger.estimate_queue_wait_time('default')
+        assert wait_t1 < wait_t0 or wait_t1 == 0.0
+
+    def test_backoff_disabled_uses_fixed_delay(self):
+        self.tiger.config['RATE_LIMIT_RETRY_DELAY'] = 1.0
+        self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = False
+        self.tiger.set_queue_rate_limit('default', '1/s')
+        for _ in range(3):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        rejections_first = self.tiger.get_queue_rejection_count('default', 60.0)
+        assert rejections_first >= 1
+        time.sleep(0.1)
+        for _ in range(3):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        rejections_second = self.tiger.get_queue_rejection_count('default', 60.0)
+        wait_first = self.tiger.estimate_queue_wait_time('default')
+        wait_second = self.tiger.estimate_queue_wait_time('default')
+        assert abs(wait_first - wait_second) < 0.5
+
+    def test_backoff_enabled_grows_delay_across_rejections(self):
+        self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = True
+        self.tiger.config['RATE_LIMIT_BACKOFF_BASE'] = 0.5
+        self.tiger.config['RATE_LIMIT_BACKOFF_FACTOR'] = 2.0
+        self.tiger.config['RATE_LIMIT_BACKOFF_MAX'] = 30.0
+        self.tiger.set_queue_rate_limit('default', '1/s')
+        for _ in range(3):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        penalty_1 = self.tiger.rate_limiter.get_penalty_count('default')
+        assert penalty_1 >= 1
+        for _ in range(3):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        penalty_2 = self.tiger.rate_limiter.get_penalty_count('default')
+        assert penalty_2 > penalty_1
+
+    def test_backoff_max_caps_delay(self):
+        self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = True
+        self.tiger.config['RATE_LIMIT_BACKOFF_BASE'] = 1.0
+        self.tiger.config['RATE_LIMIT_BACKOFF_FACTOR'] = 1000.0
+        self.tiger.config['RATE_LIMIT_BACKOFF_MAX'] = 3.0
+        self.tiger.set_queue_rate_limit('default', '1/s')
+        for _ in range(5):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        delay = self.tiger.rate_limiter.compute_backoff_delay(
+            'default', 1.0, max_delay=3.0, factor=1000.0,
+        )
+        assert delay <= 3.0
+
+    def test_delay_kwarg_rate_limit_causes_rescheduling(self):
+        for _ in range(5):
+            self.tiger.delay(simple_task, rate_limit='1/s')
+        Worker(self.tiger).run(once=True)
+        status = self.tiger.get_rate_limit_status('default')
+        assert status is None or status.get('used', 0) <= 1
+        rejections = self.tiger.get_queue_rejection_count('default', 60.0)
+        remaining_tasks = 0
+        for state in ('queued', 'scheduled', 'active'):
+            remaining_tasks += self.conn.zcard(f't:{state}:default')
+        assert remaining_tasks > 0 or rejections > 0
+
+    def test_task_constructor_rate_limit_causes_rescheduling(self):
+        for _ in range(5):
+            task = Task(self.tiger, simple_task, rate_limit='1/s')
+            task.delay()
+        Worker(self.tiger).run(once=True)
+        rejections = self.tiger.get_queue_rejection_count('default', 60.0)
+        remaining_tasks = 0
+        for state in ('queued', 'scheduled', 'active'):
+            remaining_tasks += self.conn.zcard(f't:{state}:default')
+        assert remaining_tasks > 0 or rejections > 0
+
+    def test_reset_window_on_inherited_queue(self):
+        self.tiger.set_queue_rate_limit('parent', '1/s')
+        for _ in range(3):
+            self.tiger.delay(simple_task, queue='parent.sub')
+        Worker(self.tiger).run(once=True)
+        assert self.tiger.peek_queue_rate_limit('parent.sub') is False
+        self.tiger.reset_queue_rate_limit_window('parent.sub')
+        assert self.tiger.peek_queue_rate_limit('parent.sub') is True
+
+    def test_burst_wired_into_wait_time(self):
+        self.tiger.config['RATE_LIMIT_BURST'] = {'default': 5}
+        self.tiger.set_queue_rate_limit('default', '2/s')
+        for _ in range(3):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        wait = self.tiger.estimate_queue_wait_time('default')
+        assert wait == 0.0
+
+    def test_format_rate_limit_multi_day(self):
+        assert format_rate_limit(100, 172800.0) == '100/2d'
+
+    def test_format_rate_limit_integer_window(self):
+        assert format_rate_limit(10, 30) == '10/30s'

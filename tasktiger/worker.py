@@ -674,6 +674,7 @@ class Worker:
         backoff_max = self.config.get('RATE_LIMIT_BACKOFF_MAX', 60.0)
         backoff_factor = self.config.get('RATE_LIMIT_BACKOFF_FACTOR', 2.0)
         burst_config = self.config.get('RATE_LIMIT_BURST', {})
+        fixed_delay = self.config['RATE_LIMIT_RETRY_DELAY']
 
         for task in ready_tasks:
             limits = rl.get_effective_limits(
@@ -688,23 +689,20 @@ class Worker:
                 allowed, retry_after = rl.consume_multi(limits)
 
                 if not allowed:
-                    base_delay = max(
-                        retry_after,
-                        self.config['RATE_LIMIT_RETRY_DELAY'],
-                    )
-
                     if use_backoff:
                         rl.record_penalty(queue)
-                        base_delay = rl.compute_backoff_delay(
+                        delay = rl.compute_backoff_delay(
                             queue,
-                            base_delay,
+                            backoff_base,
                             max_delay=backoff_max,
                             factor=backoff_factor,
                         )
+                    else:
+                        delay = max(retry_after, fixed_delay)
 
                     rl.record_rejection(queue)
 
-                    when = time.time() + base_delay
+                    when = time.time() + delay
                     task._move(
                         from_state=ACTIVE,
                         to_state=SCHEDULED,
@@ -714,7 +712,7 @@ class Worker:
                     log.info(
                         'rate limited',
                         task_id=task.id,
-                        retry_after=base_delay,
+                        retry_after=delay,
                         queue=queue,
                     )
                     continue
@@ -724,6 +722,11 @@ class Worker:
         ready_tasks = actually_ready
 
         if not ready_tasks:
+            for lock in locks:
+                try:
+                    lock.release()
+                except LockError:
+                    log.warning('could not release lock', lock=lock.name)
             return True, []
 
         if self.stats_thread:
