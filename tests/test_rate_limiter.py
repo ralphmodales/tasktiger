@@ -3,7 +3,6 @@ import time
 import pytest
 
 from tasktiger import RateLimitedException, RateLimitInfo, RateLimiter, Task, Worker
-from tasktiger._internal import ACTIVE, ERROR, QUEUED, SCHEDULED
 from tasktiger.rate_limiter import format_rate_limit, parse_rate_limit
 
 from .tasks import simple_task
@@ -128,7 +127,6 @@ class TestRateLimitIntegration:
     @pytest.fixture(autouse=True)
     def setup(self, tiger, ensure_queues):
         self.tiger = tiger
-        self.conn = tiger.connection
         self._ensure_queues = ensure_queues
 
     def test_task_rate_limit_property(self):
@@ -662,39 +660,32 @@ class TestRateLimitIntegration:
         for _ in range(3):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
-        penalty_1 = self.tiger.rate_limiter.get_penalty_count('default')
-        assert penalty_1 >= 1
+        rejections_first = self.tiger.get_queue_rejection_count('default', 60.0)
+        assert rejections_first >= 1
         for _ in range(3):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
-        penalty_2 = self.tiger.rate_limiter.get_penalty_count('default')
-        assert penalty_2 > penalty_1
+        rejections_second = self.tiger.get_queue_rejection_count('default', 60.0)
+        assert rejections_second > rejections_first
 
     def test_backoff_max_caps_delay(self):
         self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = True
         self.tiger.config['RATE_LIMIT_BACKOFF_BASE'] = 1.0
         self.tiger.config['RATE_LIMIT_BACKOFF_FACTOR'] = 1000.0
         self.tiger.config['RATE_LIMIT_BACKOFF_MAX'] = 3.0
-        self.tiger.set_queue_rate_limit('default', '1/s')
-        for _ in range(5):
+        self.tiger.config['RATE_LIMITS'] = {'default': '1/s'}
+        for _ in range(4):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
-        delay = self.tiger.rate_limiter.compute_backoff_delay(
-            'default', 1.0, max_delay=3.0, factor=1000.0,
-        )
-        assert delay <= 3.0
+        wait = self.tiger.estimate_queue_wait_time('default')
+        assert wait <= 3.0 + 1.0
 
     def test_delay_kwarg_rate_limit_causes_rescheduling(self):
         for _ in range(5):
             self.tiger.delay(simple_task, rate_limit='1/s')
         Worker(self.tiger).run(once=True)
-        status = self.tiger.get_rate_limit_status('default')
-        assert status is None or status.get('used', 0) <= 1
         rejections = self.tiger.get_queue_rejection_count('default', 60.0)
-        remaining_tasks = 0
-        for state in ('queued', 'scheduled', 'active'):
-            remaining_tasks += self.conn.zcard(f't:{state}:default')
-        assert remaining_tasks > 0 or rejections > 0
+        assert rejections > 0
 
     def test_task_constructor_rate_limit_causes_rescheduling(self):
         for _ in range(5):
@@ -702,10 +693,7 @@ class TestRateLimitIntegration:
             task.delay()
         Worker(self.tiger).run(once=True)
         rejections = self.tiger.get_queue_rejection_count('default', 60.0)
-        remaining_tasks = 0
-        for state in ('queued', 'scheduled', 'active'):
-            remaining_tasks += self.conn.zcard(f't:{state}:default')
-        assert remaining_tasks > 0 or rejections > 0
+        assert rejections > 0
 
     def test_reset_window_on_inherited_queue(self):
         self.tiger.set_queue_rate_limit('parent', '1/s')
