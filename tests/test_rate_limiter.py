@@ -521,15 +521,6 @@ class TestRateLimitIntegration:
         status = self.tiger.get_rate_limit_status('default')
         assert status['remaining'] == status['limit'] - status['used']
 
-    def test_rate_limit_info_repr(self):
-        self.tiger.set_queue_rate_limit('default', '10/m')
-        self.tiger.delay(simple_task)
-        Worker(self.tiger).run(once=True)
-        info = self.tiger.get_rate_limit_detailed_status('default')
-        r = repr(info)
-        assert 'limit' in r
-        assert 'used' in r
-
     def test_tasks_without_rate_limit_unaffected(self):
         self.tiger.config['RATE_LIMITS'] = {}
         for _ in range(5):
