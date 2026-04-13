@@ -237,3 +237,108 @@ class MyErrorRunnerClass(DefaultRunner):
         assert execution["exception_name"] == "builtins:Exception"
         with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
             conn.set("task_id", task.id)
+
+
+class TraceBeforeRunner(BaseRunner):
+    def before_execute(self, task, context):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("runner_trace", "before:" + type(self).__name__)
+        context.set("trace_started", True)
+
+    def after_execute(self, task, context):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("runner_trace", "after:" + type(self).__name__)
+
+    def on_execute_error(self, task, context, exc_info):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("runner_trace", "error:" + type(self).__name__)
+        return None
+
+
+class TraceAfterRunner(BaseRunner):
+    def before_execute(self, task, context):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("runner_trace", "before:" + type(self).__name__)
+
+    def after_execute(self, task, context):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("runner_trace", "after:" + type(self).__name__)
+
+    def on_execute_error(self, task, context, exc_info):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("runner_trace", "error:" + type(self).__name__)
+        return None
+
+
+class SuppressingRunner(BaseRunner):
+    def on_execute_error(self, task, context, exc_info):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("runner_trace", "suppressed:" + type(self).__name__)
+        return True
+
+
+class ContextWriterRunner(BaseRunner):
+    def before_execute(self, task, context):
+        context.set("writer_was_here", True)
+        context.set("task_id", task.id)
+
+
+class ContextReaderRunner(BaseRunner):
+    def before_execute(self, task, context):
+        writer_was_here = context.get("writer_was_here", False)
+        task_id = context.get("task_id", "")
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.set("context_writer_was_here", str(writer_was_here))
+            conn.set("context_task_id", task_id)
+
+
+class PermanentErrorTraceRunner(BaseRunner):
+    def on_permanent_error(self, task, execution):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("permanent_error_trace", type(self).__name__)
+
+
+class PermanentErrorTraceRunner2(BaseRunner):
+    def on_permanent_error(self, task, execution):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("permanent_error_trace", type(self).__name__)
+
+
+class BatchTraceRunner(BaseRunner):
+    def before_batch_execute(self, tasks, context):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("batch_trace", "before:" + str(len(tasks)))
+
+    def after_batch_execute(self, tasks, context):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("batch_trace", "after:" + str(len(tasks)))
+
+
+class ExecutorTraceRunner(DefaultRunner):
+    def before_execute(self, task, context):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("runner_trace", "before:" + type(self).__name__)
+
+    def after_execute(self, task, context):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("runner_trace", "after:" + type(self).__name__)
+
+
+class FailingBeforeRunner(BaseRunner):
+    def before_execute(self, task, context):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("runner_trace", "before:" + type(self).__name__)
+        raise RuntimeError("before hook failed")
+
+    def after_execute(self, task, context):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.rpush("runner_trace", "after:" + type(self).__name__)
+
+
+class EagerChainRunner(BaseRunner):
+    def before_execute(self, task, context):
+        context.set("eager_before", True)
+
+    def after_execute(self, task, context):
+        with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+            conn.set("eager_chain_ran", str(context.get("eager_before", False)))

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Dict, List, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 from structlog.stdlib import BoundLogger
 
@@ -54,6 +54,28 @@ class BaseRunner:
         This is called in the main worker process.
         """
 
+    def before_execute(self, task: "Task", context: Any) -> None:
+        pass
+
+    def after_execute(self, task: "Task", context: Any) -> None:
+        pass
+
+    def on_execute_error(
+        self, task: "Task", context: Any, exc_info: tuple
+    ) -> Optional[bool]:
+        return None
+
+    def before_batch_execute(self, tasks: List["Task"], context: Any) -> None:
+        pass
+
+    def after_batch_execute(self, tasks: List["Task"], context: Any) -> None:
+        pass
+
+    def on_batch_execute_error(
+        self, tasks: List["Task"], context: Any, exc_info: tuple
+    ) -> Optional[bool]:
+        return None
+
 
 class DefaultRunner(BaseRunner):
     """
@@ -81,22 +103,45 @@ class DefaultRunner(BaseRunner):
 
 
 def get_runner_class(log: BoundLogger, tasks: List["Task"]) -> Type[BaseRunner]:
-    runner_class_paths = {task.serialized_runner_class for task in tasks}
-    if len(runner_class_paths) > 1:
+    raw_paths = []
+    for task in tasks:
+        p = task.serialized_runner_class
+        if isinstance(p, list):
+            raw_paths.append(tuple(p))
+        else:
+            raw_paths.append(p)
+
+    unique_paths = set(raw_paths)
+    if len(unique_paths) > 1:
         log.error(
             "cannot mix multiple runner classes",
-            runner_class_paths=", ".join(str(p) for p in runner_class_paths),
+            runner_class_paths=", ".join(str(p) for p in unique_paths),
         )
         raise ValueError("Found multiple runner classes in batch task.")
 
-    runner_class_path = runner_class_paths.pop()
+    runner_class_path = unique_paths.pop()
+
     if runner_class_path:
-        try:
-            return import_attribute(runner_class_path)
-        except TaskImportError:
-            log.error(
-                "could not import runner class",
-                runner_class_path=runner_class_path,
-            )
-            raise
+        if isinstance(runner_class_path, tuple):
+            from .runner_chain import deserialize_runner_chain, make_chained_runner_class
+
+            try:
+                chain_classes = deserialize_runner_chain(list(runner_class_path))
+            except TaskImportError:
+                log.error(
+                    "could not import runner class in chain",
+                    runner_class_paths=runner_class_path,
+                )
+                raise
+            return make_chained_runner_class(chain_classes)
+        else:
+            try:
+                return import_attribute(runner_class_path)
+            except TaskImportError:
+                log.error(
+                    "could not import runner class",
+                    runner_class_path=runner_class_path,
+                )
+                raise
+
     return DefaultRunner
