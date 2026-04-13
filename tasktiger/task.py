@@ -60,7 +60,9 @@ class Task:
         ] = None,
         max_queue_size: Optional[int] = None,
         max_stored_executions: Optional[int] = None,
-        runner_class: Optional[Type["BaseRunner"]] = None,
+        runner_class: Optional[
+            Union[Type["BaseRunner"], List[Type["BaseRunner"]]]
+        ] = None,
         # internal variables
         _data: Any = None,
         _state: Any = None,
@@ -120,6 +122,9 @@ class Task:
         if runner_class is None:
             runner_class = getattr(func, "_task_runner_class", None)
 
+        if runner_class is None and tiger.config.get("DEFAULT_RUNNER_CHAIN"):
+            runner_class = tiger.config["DEFAULT_RUNNER_CHAIN"]
+
         # normalize falsy args/kwargs to empty structures
         args = args or []
         kwargs = kwargs or {}
@@ -161,9 +166,13 @@ class Task:
             task["max_queue_size"] = max_queue_size
         if max_stored_executions is not None:
             task["max_stored_executions"] = max_stored_executions
-        if runner_class:
-            serialized_runner_class = serialize_func_name(runner_class)
-            task["runner_class"] = serialized_runner_class
+        if isinstance(runner_class, (list, tuple)):
+            from .runner_chain import serialize_runner_chain, validate_runner_chain
+
+            validate_runner_chain(runner_class)
+            task["runner_class"] = serialize_runner_chain(runner_class)
+        elif runner_class:
+            task["runner_class"] = serialize_func_name(runner_class)
 
         self._data = task
 
@@ -279,8 +288,15 @@ class Task:
         return self._data.get("max_stored_executions")
 
     @property
-    def serialized_runner_class(self) -> str:
+    def serialized_runner_class(self) -> Optional[Union[str, List[str]]]:
         return self._data.get("runner_class")
+
+    @property
+    def runner_chain(self) -> Optional[List[str]]:
+        rc = self._data.get("runner_class")
+        if isinstance(rc, list):
+            return list(rc)
+        return None
 
     @property
     def ts(self) -> Optional[datetime.datetime]:

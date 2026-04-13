@@ -7,6 +7,7 @@ from .exceptions import (
     TaskNotFound,
 )
 from .retry import exponential, fixed, linear
+from .runner_chain import ChainedRunner, RunnerContext
 from .schedule import cron_expr, periodic
 from .task import Task
 from .tasktiger import TaskTiger, run_worker
@@ -31,6 +32,9 @@ __all__ = [
     # Schedules
     "periodic",
     "cron_expr",
+    # Runner chaining
+    "ChainedRunner",
+    "RunnerContext",
 ]
 
 

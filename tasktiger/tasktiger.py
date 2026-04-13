@@ -222,6 +222,7 @@ class TaskTiger:
             # Whether to publish new tasks to the activity channel. Only set to
             # False if all the workers are polling queues.
             "PUBLISH_QUEUED_TASKS": True,
+            "DEFAULT_RUNNER_CHAIN": None,
         }
         if config:
             self.config.update(config)
@@ -319,7 +320,9 @@ class TaskTiger:
         batch: bool = False,
         max_queue_size: Optional[int] = None,
         max_stored_executions: Optional[int] = None,
-        runner_class: Optional[Type["BaseRunner"]] = None,
+        runner_class: Optional[
+            Union[Type["BaseRunner"], List[Type["BaseRunner"]]]
+        ] = None,
     ) -> Callable:
         """
         Function decorator that defines the behavior of the function when it is
@@ -446,7 +449,9 @@ class TaskTiger:
         ] = None,
         max_queue_size: Optional[int] = None,
         max_stored_executions: Optional[int] = None,
-        runner_class: Optional[Type["BaseRunner"]] = None,
+        runner_class: Optional[
+            Union[Type["BaseRunner"], List[Type["BaseRunner"]]]
+        ] = None,
     ) -> Task:
         """
         Queues a task. See README.rst for an explanation of the options.
