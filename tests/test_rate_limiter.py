@@ -1,11 +1,13 @@
 import time
 
 import pytest
+import redis
 
 from tasktiger import RateLimitedException, RateLimitInfo, RateLimiter, Task, Worker
 from tasktiger.rate_limiter import format_rate_limit, parse_rate_limit
 
-from .tasks import counting_task, locked_rate_limited_task, simple_task
+from .config import REDIS_HOST, TEST_DB
+from .tasks import simple_task
 from .utils import external_worker, get_tiger
 
 _tiger = get_tiger()
@@ -29,6 +31,18 @@ def rate_limited_slow_task():
 @_tiger.task(queue='rate_limited_queue')
 def queue_rate_limited_task():
     pass
+
+
+@_tiger.task()
+def counting_task():
+    with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+        conn.incr('exec_count')
+
+
+@_tiger.task(lock=True, rate_limit='1/s')
+def locked_rate_limited_task(key):
+    with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
+        conn.incr('locked_rl_exec:' + key)
 
 
 class TestParseRateLimit:

@@ -194,18 +194,6 @@ def sleep_task(delay=10):
     time.sleep(delay)
 
 
-@tiger.task()
-def counting_task():
-    with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
-        conn.incr('exec_count')
-
-
-@tiger.task(lock=True, rate_limit='1/s')
-def locked_rate_limited_task(key):
-    with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
-        conn.incr('locked_rl_exec:' + key)
-
-
 @tiger.task(hard_timeout=1)
 def decorated_task_sleep_timeout(delay=10):
     time.sleep(delay)
@@ -249,4 +237,3 @@ class MyErrorRunnerClass(DefaultRunner):
         assert execution["exception_name"] == "builtins:Exception"
         with redis.Redis(host=REDIS_HOST, db=TEST_DB, decode_responses=True) as conn:
             conn.set("task_id", task.id)
-
