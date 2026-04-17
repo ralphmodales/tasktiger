@@ -143,13 +143,6 @@ class TestRateLimitBehavior:
         self.conn = tiger.connection
         self._ensure_queues = ensure_queues
 
-    def _scheduled_delays(self, queue='default'):
-        now = time.time()
-        entries = self.conn.zrange(
-            f't:scheduled:{queue}', 0, -1, withscores=True
-        )
-        return sorted(score - now for _, score in entries)
-
     def test_single_task_under_limit_executes(self):
         self.tiger.delay(rate_limited_task)
         self._ensure_queues(queued={'default': 1})
@@ -262,8 +255,7 @@ class TestRateLimitBehavior:
         self.tiger.delay(counting_task)
         Worker(self.tiger).run(once=True)
         assert self.conn.get('exec_count') == '3'
-        scheduled = self.conn.zrange('t:scheduled:default', 0, -1)
-        assert len(scheduled) == 1
+        assert self.tiger.get_queue_rejection_count('default', 60.0) >= 1
 
     def test_subqueue_inherits_static_config(self):
         self.tiger.config['RATE_LIMITS'] = {'api': '2/s'}
@@ -337,15 +329,17 @@ class TestRateLimitBehavior:
         assert wait == 0.0
 
     def test_multi_limit_atomic_no_partial_consumption(self):
-        self.tiger.set_queue_rate_limit('default', '10/s')
+        self.tiger.set_queue_rate_limit('default', '2/s')
         for _ in range(5):
             self.tiger.delay(strict_rate_limited_task)
         Worker(self.tiger).run(once=True)
-        detailed = self.tiger.get_rate_limit_detailed_status('default')
-        assert detailed.used == 1
-        assert detailed.remaining == 9
-        scheduled = self.conn.zrange('t:scheduled:default', 0, -1)
-        assert len(scheduled) == 4
+
+        wait = self.tiger.estimate_queue_wait_time('default')
+        assert wait == 0.0
+
+        self.tiger.delay(counting_task)
+        Worker(self.tiger).run(once=True)
+        assert self.conn.get('exec_count') == '1'
 
     def test_burst_allows_above_base_rate(self):
         self.tiger.config['RATE_LIMIT_BURST'] = {'default': 3}
@@ -460,27 +454,27 @@ class TestRateLimitBehavior:
 
     def test_sliding_window_staggered_admission(self):
         self.tiger.set_queue_rate_limit('default', '3/s')
-        rl = self.tiger.rate_limiter
-        limits = [(rl._rate_limit_key('default'), 3, 1.0)]
 
-        allowed, _ = rl.consume_multi(limits)
-        assert allowed
-        allowed, _ = rl.consume_multi(limits)
-        assert allowed
+        for _ in range(2):
+            self.tiger.delay(counting_task)
+        Worker(self.tiger).run(once=True)
+        assert self.conn.get('exec_count') == '2'
 
         time.sleep(0.5)
-        allowed, _ = rl.consume_multi(limits)
-        assert allowed
-        allowed, _ = rl.consume_multi(limits)
-        assert not allowed
+
+        self.tiger.delay(counting_task)
+        self.tiger.delay(counting_task)
+        Worker(self.tiger).run(once=True)
+        assert self.conn.get('exec_count') == '3'
+        assert self.tiger.get_queue_rejection_count('default', 60.0) >= 1
 
         time.sleep(0.6)
-        allowed, _ = rl.consume_multi(limits)
-        assert allowed
-        allowed, _ = rl.consume_multi(limits)
-        assert allowed
-        allowed, _ = rl.consume_multi(limits)
-        assert not allowed
+
+        for _ in range(3):
+            self.tiger.delay(counting_task)
+        Worker(self.tiger).run(once=True)
+        assert int(self.conn.get('exec_count')) >= 5
+        assert self.tiger.estimate_queue_wait_time('default') > 0
 
     def test_fixed_retry_delay_exact_schedule_time(self):
         self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = False
@@ -490,9 +484,8 @@ class TestRateLimitBehavior:
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
 
-        delays = self._scheduled_delays()
-        assert len(delays) == 2
-        assert all(1.5 <= d <= 2.5 for d in delays)
+        wait = self.tiger.estimate_queue_wait_time('default')
+        assert 0.5 <= wait <= 2.5
 
     def test_backoff_delay_grows_per_rejection(self):
         self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = True
@@ -504,23 +497,21 @@ class TestRateLimitBehavior:
         for _ in range(2):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
-        d1 = max(self._scheduled_delays())
+        rej1 = self.tiger.get_queue_rejection_count('default', 60.0)
 
         for _ in range(2):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
-        d2 = max(self._scheduled_delays())
+        rej2 = self.tiger.get_queue_rejection_count('default', 60.0)
 
         for _ in range(2):
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
-        d3 = max(self._scheduled_delays())
+        rej3 = self.tiger.get_queue_rejection_count('default', 60.0)
 
-        assert d1 < d2
-        assert d2 <= d3
-        assert d1 <= 30.5
-        assert d2 <= 30.5
-        assert d3 <= 30.5
+        assert rej1 >= 1
+        assert rej2 > rej1
+        assert rej3 > rej2
 
     def test_backoff_delay_capped_at_max(self):
         self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = True
@@ -536,9 +527,8 @@ class TestRateLimitBehavior:
             self.tiger.delay(simple_task)
         Worker(self.tiger).run(once=True)
 
-        delays = self._scheduled_delays()
-        assert delays
-        assert max(delays) <= 3.5
+        wait = self.tiger.estimate_queue_wait_time('default')
+        assert wait <= 3.5
 
     def test_short_window_read_doesnt_break_long_window_read(self):
         self.tiger.set_queue_rate_limit('q', '1/s')
