@@ -620,10 +620,11 @@ class Worker:
         log: BoundLogger = self.log.bind(queue=queue)
         assert isinstance(log, BoundLogger)
 
-        locks = []
+        locks: List[Any] = []
         # Keep track of the acquired locks: If two tasks in the list require
         # the same lock we only acquire it once.
-        lock_ids = set()
+        lock_ids: Set[str] = set()
+        task_locks: Dict[str, List[Any]] = {}
 
         ready_tasks = []
         for task in tasks:
@@ -664,6 +665,7 @@ class Worker:
 
                     lock_ids.add(lock_id)
                     locks.append(lock)
+                    task_locks.setdefault(task.id, []).append(lock)
 
             ready_tasks.append(task)
 
@@ -702,6 +704,12 @@ class Worker:
 
                     rl.record_rejection(queue)
 
+                    for lk in task_locks.pop(task.id, []):
+                        try:
+                            lk.release()
+                        except LockError:
+                            log.warning('could not release lock', lock=lk.name)
+
                     when = time.time() + delay
                     task._move(
                         from_state=ACTIVE,
@@ -720,6 +728,7 @@ class Worker:
             actually_ready.append(task)
 
         ready_tasks = actually_ready
+        locks = [lk for t in ready_tasks for lk in task_locks.get(t.id, [])]
 
         if not ready_tasks:
             for lock in locks:

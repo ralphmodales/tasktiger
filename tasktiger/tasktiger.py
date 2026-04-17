@@ -523,7 +523,7 @@ class TaskTiger:
         self.rate_limiter.set_bulk_rate_limits(limits)
 
     def get_bulk_queue_rate_limits(self, queues: List[str]) -> Dict[str, Optional[str]]:
-        return self.rate_limiter.get_bulk_rate_limits(queues)
+        return {q: self.get_queue_rate_limit(q) for q in queues}
 
     def clear_bulk_queue_rate_limits(self, queues: List[str]) -> None:
         self.rate_limiter.clear_bulk_rate_limits(queues)

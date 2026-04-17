@@ -5,7 +5,7 @@ import pytest
 from tasktiger import RateLimitedException, RateLimitInfo, RateLimiter, Task, Worker
 from tasktiger.rate_limiter import format_rate_limit, parse_rate_limit
 
-from .tasks import simple_task
+from .tasks import counting_task, locked_rate_limited_task, simple_task
 from .utils import external_worker, get_tiger
 
 _tiger = get_tiger()
@@ -126,7 +126,15 @@ class TestRateLimitBehavior:
     @pytest.fixture(autouse=True)
     def setup(self, tiger, ensure_queues):
         self.tiger = tiger
+        self.conn = tiger.connection
         self._ensure_queues = ensure_queues
+
+    def _scheduled_delays(self, queue='default'):
+        now = time.time()
+        entries = self.conn.zrange(
+            f't:scheduled:{queue}', 0, -1, withscores=True
+        )
+        return sorted(score - now for _, score in entries)
 
     def test_single_task_under_limit_executes(self):
         self.tiger.delay(rate_limited_task)
@@ -221,16 +229,27 @@ class TestRateLimitBehavior:
         Worker(self.tiger).run(once=True)
         self._ensure_queues(queued={'default': 0})
 
-    def test_clear_preserves_rejection_history(self):
-        self.tiger.set_queue_rate_limit('default', '1/s')
+    def test_clear_preserves_window_state(self):
+        self.tiger.set_queue_rate_limit('default', '3/s')
         for _ in range(3):
-            self.tiger.delay(simple_task)
+            self.tiger.delay(counting_task)
         Worker(self.tiger).run(once=True)
-        rejections_before = self.tiger.get_queue_rejection_count('default', 60.0)
-        assert rejections_before > 0
+        assert self.conn.get('exec_count') == '3'
+        wait1 = self.tiger.estimate_queue_wait_time('default')
+        assert wait1 > 0
+
         self.tiger.clear_queue_rate_limit('default')
         assert self.tiger.get_queue_rate_limit('default') is None
-        assert self.tiger.get_queue_rejection_count('default', 60.0) == rejections_before
+
+        self.tiger.set_queue_rate_limit('default', '3/s')
+        wait2 = self.tiger.estimate_queue_wait_time('default')
+        assert wait2 > 0
+
+        self.tiger.delay(counting_task)
+        Worker(self.tiger).run(once=True)
+        assert self.conn.get('exec_count') == '3'
+        scheduled = self.conn.zrange('t:scheduled:default', 0, -1)
+        assert len(scheduled) == 1
 
     def test_subqueue_inherits_static_config(self):
         self.tiger.config['RATE_LIMITS'] = {'api': '2/s'}
@@ -303,12 +322,16 @@ class TestRateLimitBehavior:
         wait = self.tiger.estimate_queue_wait_time('default')
         assert wait == 0.0
 
-    def test_multi_limit_all_or_nothing(self):
-        self.tiger.set_queue_rate_limit('default', '5/s')
-        for _ in range(3):
+    def test_multi_limit_atomic_no_partial_consumption(self):
+        self.tiger.set_queue_rate_limit('default', '10/s')
+        for _ in range(5):
             self.tiger.delay(strict_rate_limited_task)
         Worker(self.tiger).run(once=True)
-        assert self.tiger.get_queue_rejection_count('default', 60.0) >= 2
+        detailed = self.tiger.get_rate_limit_detailed_status('default')
+        assert detailed.used == 1
+        assert detailed.remaining == 9
+        scheduled = self.conn.zrange('t:scheduled:default', 0, -1)
+        assert len(scheduled) == 4
 
     def test_burst_allows_above_base_rate(self):
         self.tiger.config['RATE_LIMIT_BURST'] = {'default': 3}
@@ -382,6 +405,192 @@ class TestRateLimitBehavior:
         Worker(self.tiger).run(once=True)
         wait = self.tiger.estimate_queue_wait_time('default')
         assert wait <= 4.0
+
+    def test_tasks_over_limit_get_rescheduled_and_run_later(self):
+        self.tiger.set_queue_rate_limit('default', '2/s')
+        for _ in range(5):
+            self.tiger.delay(counting_task)
+        self._ensure_queues(queued={'default': 5})
+
+        Worker(self.tiger).run(once=True)
+        self._ensure_queues(queued={'default': 0}, scheduled={'default': 3})
+        assert self.conn.get('exec_count') == '2'
+
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            time.sleep(1.3)
+            Worker(self.tiger).run(once=True)
+            Worker(self.tiger).run(once=True)
+            if self.conn.get('exec_count') == '5':
+                break
+
+        assert self.conn.get('exec_count') == '5'
+        self._ensure_queues()
+
+    def test_sliding_window_gradual_expiry(self):
+        self.tiger.set_queue_rate_limit('default', '4/s')
+        for _ in range(4):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+
+        wait_full = self.tiger.estimate_queue_wait_time('default')
+        assert wait_full > 0
+
+        time.sleep(0.5)
+        wait_mid = self.tiger.estimate_queue_wait_time('default')
+        assert wait_mid < wait_full
+
+        time.sleep(0.6)
+        wait_end = self.tiger.estimate_queue_wait_time('default')
+        assert wait_end == 0.0
+
+    def test_sliding_window_staggered_admission(self):
+        self.tiger.set_queue_rate_limit('default', '3/s')
+        rl = self.tiger.rate_limiter
+        limits = [(rl._rate_limit_key('default'), 3, 1.0)]
+
+        allowed, _ = rl.consume_multi(limits)
+        assert allowed
+        allowed, _ = rl.consume_multi(limits)
+        assert allowed
+
+        time.sleep(0.5)
+        allowed, _ = rl.consume_multi(limits)
+        assert allowed
+        allowed, _ = rl.consume_multi(limits)
+        assert not allowed
+
+        time.sleep(0.6)
+        allowed, _ = rl.consume_multi(limits)
+        assert allowed
+        allowed, _ = rl.consume_multi(limits)
+        assert allowed
+        allowed, _ = rl.consume_multi(limits)
+        assert not allowed
+
+    def test_fixed_retry_delay_exact_schedule_time(self):
+        self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = False
+        self.tiger.config['RATE_LIMIT_RETRY_DELAY'] = 2.0
+        self.tiger.set_queue_rate_limit('default', '1/s')
+        for _ in range(3):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+
+        delays = self._scheduled_delays()
+        assert len(delays) == 2
+        assert all(1.5 <= d <= 2.5 for d in delays)
+
+    def test_backoff_delay_grows_per_rejection(self):
+        self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = True
+        self.tiger.config['RATE_LIMIT_BACKOFF_BASE'] = 0.5
+        self.tiger.config['RATE_LIMIT_BACKOFF_FACTOR'] = 2.0
+        self.tiger.config['RATE_LIMIT_BACKOFF_MAX'] = 30.0
+        self.tiger.set_queue_rate_limit('default', '1/s')
+
+        for _ in range(2):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        d1 = max(self._scheduled_delays())
+
+        for _ in range(2):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        d2 = max(self._scheduled_delays())
+
+        for _ in range(2):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        d3 = max(self._scheduled_delays())
+
+        assert d1 < d2
+        assert d2 <= d3
+        assert d1 <= 30.5
+        assert d2 <= 30.5
+        assert d3 <= 30.5
+
+    def test_backoff_delay_capped_at_max(self):
+        self.tiger.config['RATE_LIMIT_BACKOFF_ENABLED'] = True
+        self.tiger.config['RATE_LIMIT_BACKOFF_BASE'] = 1.0
+        self.tiger.config['RATE_LIMIT_BACKOFF_FACTOR'] = 1000.0
+        self.tiger.config['RATE_LIMIT_BACKOFF_MAX'] = 3.0
+        self.tiger.set_queue_rate_limit('default', '1/s')
+
+        for _ in range(4):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+        for _ in range(3):
+            self.tiger.delay(simple_task)
+        Worker(self.tiger).run(once=True)
+
+        delays = self._scheduled_delays()
+        assert delays
+        assert max(delays) <= 3.5
+
+    def test_short_window_read_doesnt_break_long_window_read(self):
+        self.tiger.set_queue_rate_limit('q', '1/s')
+        for _ in range(5):
+            self.tiger.delay(simple_task, queue='q')
+        Worker(self.tiger, queues=['q']).run(once=True)
+
+        assert self.tiger.get_queue_rejection_count('q', 60.0) == 4
+
+        self.tiger.get_queue_rejection_count('q', 0.001)
+        time.sleep(0.2)
+        count_long = self.tiger.get_queue_rejection_count('q', 3600.0)
+        assert count_long == 4
+
+    def test_rate_limited_locked_task_releases_lock(self):
+        for key in ('k1', 'k2', 'k3'):
+            self.tiger.delay(locked_rate_limited_task, args=(key,))
+
+        Worker(self.tiger).run(once=True)
+
+        admitted = 0
+        for key in ('k1', 'k2', 'k3'):
+            val = self.conn.get('locked_rl_exec:' + key)
+            if val == '1':
+                admitted += 1
+        assert admitted == 1
+
+        time.sleep(1.2)
+        Worker(self.tiger).run(once=True)
+        Worker(self.tiger).run(once=True)
+        time.sleep(1.2)
+        Worker(self.tiger).run(once=True)
+        Worker(self.tiger).run(once=True)
+
+        for key in ('k1', 'k2', 'k3'):
+            assert self.conn.get('locked_rl_exec:' + key) == '1'
+
+        self._ensure_queues()
+
+    def test_burst_applies_to_parent_when_child_inherits(self):
+        self.tiger.config['RATE_LIMITS'] = {'api': '2/s'}
+        self.tiger.config['RATE_LIMIT_BURST'] = {'api': 10}
+        for _ in range(8):
+            self.tiger.delay(simple_task, queue='api.v1')
+        Worker(self.tiger, queues=['api.v1']).run(once=True)
+
+        rejections = self.tiger.get_queue_rejection_count('api.v1', 60.0)
+        rejections_parent = self.tiger.get_queue_rejection_count('api', 60.0)
+        assert rejections == 0
+        assert rejections_parent == 0
+
+    def test_bulk_get_matches_single_get_with_inheritance(self):
+        self.tiger.config['RATE_LIMITS'] = {'api': '5/s'}
+        self.tiger.set_queue_rate_limit('billing.v1', '10/m')
+
+        result = self.tiger.get_bulk_queue_rate_limits(
+            ['api.v1', 'api', 'billing.v1', 'nothing']
+        )
+        assert result == {
+            'api.v1': '5/s',
+            'api': '5/s',
+            'billing.v1': '10/m',
+            'nothing': None,
+        }
+        for q in ['api.v1', 'api', 'billing.v1', 'nothing']:
+            assert result[q] == self.tiger.get_queue_rate_limit(q)
 
     def test_package_exports(self):
         from tasktiger import RateLimitedException as Exc

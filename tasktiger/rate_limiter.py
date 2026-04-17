@@ -17,6 +17,8 @@ UNIT_MAP = {
 
 RATE_LIMIT_RE = re.compile(r'^(\d+)/(\d*)(s|m|h|d)$')
 
+REJECTION_RETENTION_SECONDS = 86400
+
 
 def parse_rate_limit(rate_limit_str: str) -> Tuple[int, float]:
     match = RATE_LIMIT_RE.match(rate_limit_str)
@@ -152,12 +154,12 @@ class RateLimiter:
 
     def _resolve_queue_rate_limit(
         self, queue: str, rate_limits_config: Dict[str, str]
-    ) -> Optional[Tuple[str, int, float]]:
+    ) -> Optional[Tuple[str, int, float, str]]:
         config_val, effective_queue = self.resolve_queue_config(queue, rate_limits_config)
         if config_val is None:
             return None
         count, window = parse_rate_limit(config_val)
-        return (self._rate_limit_key(effective_queue), count, window)
+        return (self._rate_limit_key(effective_queue), count, window, effective_queue)
 
     def _resolve_task_rate_limit(
         self, serialized_func: str, task_rate_limit_str: Optional[str]
@@ -180,9 +182,9 @@ class RateLimiter:
 
         queue_limit = self._resolve_queue_rate_limit(queue, rate_limits_config)
         if queue_limit:
-            key, count, window = queue_limit
+            key, count, window, effective_queue = queue_limit
             if burst_config:
-                count += burst_config.get(queue, 0)
+                count += burst_config.get(effective_queue, 0)
             limits.append((key, count, window))
 
         task_limit = self._resolve_task_rate_limit(serialized_func, task_rate_limit)
@@ -373,15 +375,15 @@ class RateLimiter:
         member = f'{now}:{random.randint(0, 999999)}'
         pipe = self._redis.pipeline(True)
         pipe.zadd(key, {member: now})
-        pipe.expire(key, 86400)
+        pipe.zremrangebyscore(key, 0, now - REJECTION_RETENTION_SECONDS)
+        pipe.expire(key, REJECTION_RETENTION_SECONDS + 60)
         pipe.execute()
 
     def get_rejection_count(self, name: str, window: float = 3600.0) -> int:
         now = time.time()
         window_start = now - window
         key = self._history_key(name)
-        self._redis.zremrangebyscore(key, 0, window_start)
-        return self._redis.zcard(key)
+        return self._redis.zcount(key, window_start, '+inf')
 
     def get_rejection_rate(self, name: str, window: float = 60.0) -> float:
         count = self.get_rejection_count(name, window)
