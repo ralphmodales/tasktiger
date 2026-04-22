@@ -35,6 +35,7 @@ from .redis_scripts import RedisScripts
 from .redis_semaphore import Semaphore
 from .retry import fixed
 from .runner import BaseRunner
+from .rate_limiter import RateLimiter
 from .task import Task
 from .worker import LOCK_REDIS_KEY, Worker
 
@@ -222,6 +223,13 @@ class TaskTiger:
             # Whether to publish new tasks to the activity channel. Only set to
             # False if all the workers are polling queues.
             "PUBLISH_QUEUED_TASKS": True,
+            'RATE_LIMITS': {},
+            'RATE_LIMIT_RETRY_DELAY': 1.0,
+            'RATE_LIMIT_BACKOFF_ENABLED': False,
+            'RATE_LIMIT_BACKOFF_BASE': 1.0,
+            'RATE_LIMIT_BACKOFF_MAX': 60.0,
+            'RATE_LIMIT_BACKOFF_FACTOR': 2.0,
+            'RATE_LIMIT_BURST': {},
         }
         if config:
             self.config.update(config)
@@ -320,6 +328,7 @@ class TaskTiger:
         max_queue_size: Optional[int] = None,
         max_stored_executions: Optional[int] = None,
         runner_class: Optional[Type["BaseRunner"]] = None,
+        rate_limit: Optional[str] = None,
     ) -> Callable:
         """
         Function decorator that defines the behavior of the function when it is
@@ -368,6 +377,8 @@ class TaskTiger:
                 func._task_max_stored_executions = max_stored_executions  # type: ignore[attr-defined]
             if runner_class is not None:
                 func._task_runner_class = runner_class  # type: ignore[attr-defined]
+            if rate_limit is not None:
+                func._task_rate_limit = rate_limit  # type: ignore[attr-defined]
 
             func.delay = _delay(func)  # type: ignore[attr-defined]
 
@@ -447,6 +458,7 @@ class TaskTiger:
         max_queue_size: Optional[int] = None,
         max_stored_executions: Optional[int] = None,
         runner_class: Optional[Type["BaseRunner"]] = None,
+        rate_limit: Optional[str] = None,
     ) -> Task:
         """
         Queues a task. See README.rst for an explanation of the options.
@@ -468,11 +480,103 @@ class TaskTiger:
             retry_method=retry_method,
             max_stored_executions=max_stored_executions,
             runner_class=runner_class,
+            rate_limit=rate_limit,
         )
 
         task.delay(when=when, max_queue_size=max_queue_size)
 
         return task
+
+    @property
+    def rate_limiter(self) -> "RateLimiter":
+        if not hasattr(self, '_rate_limiter_instance'):
+            self._rate_limiter_instance = RateLimiter(
+                self.connection, self.config['REDIS_PREFIX']
+            )
+        return self._rate_limiter_instance
+
+    def _resolve_rate_limit_config(self, queue: str) -> Tuple[Optional[str], str]:
+        return self.rate_limiter.resolve_queue_config(
+            queue, self.config['RATE_LIMITS']
+        )
+
+    def set_queue_rate_limit(self, queue: str, rate_limit: str) -> None:
+        self.rate_limiter.set_rate_limit(queue, rate_limit)
+
+    def get_rate_limit_status(self, queue: str) -> Optional[Dict]:
+        from .rate_limiter import parse_rate_limit as _parse
+        config_val, effective_queue = self._resolve_rate_limit_config(queue)
+        if config_val is None:
+            return None
+        count, window = _parse(config_val)
+        key = self.rate_limiter._rate_limit_key(effective_queue)
+        return self.rate_limiter.get_status(key, count, window)
+
+    def clear_queue_rate_limit(self, queue: str) -> None:
+        self.rate_limiter.clear_rate_limit(queue)
+
+    def get_queue_rate_limit(self, queue: str) -> Optional[str]:
+        config_val, _ = self._resolve_rate_limit_config(queue)
+        return config_val
+
+    def set_bulk_queue_rate_limits(self, limits: Dict[str, str]) -> None:
+        self.rate_limiter.set_bulk_rate_limits(limits)
+
+    def get_bulk_queue_rate_limits(self, queues: List[str]) -> Dict[str, Optional[str]]:
+        return {q: self.get_queue_rate_limit(q) for q in queues}
+
+    def clear_bulk_queue_rate_limits(self, queues: List[str]) -> None:
+        self.rate_limiter.clear_bulk_rate_limits(queues)
+
+    def get_rate_limit_detailed_status(self, queue: str) -> Optional[Any]:
+        from .rate_limiter import parse_rate_limit as _parse
+        config_val, effective_queue = self._resolve_rate_limit_config(queue)
+        if config_val is None:
+            return None
+        count, window = _parse(config_val)
+        key = self.rate_limiter._rate_limit_key(effective_queue)
+        burst = self.config.get('RATE_LIMIT_BURST', {}).get(effective_queue, 0)
+        return self.rate_limiter.get_detailed_status(key, count, window, burst)
+
+    def get_queue_rejection_count(self, queue: str, window: float = 3600.0) -> int:
+        return self.rate_limiter.get_rejection_count(queue, window)
+
+    def get_queue_rejection_rate(self, queue: str, window: float = 60.0) -> float:
+        return self.rate_limiter.get_rejection_rate(queue, window)
+
+    def estimate_queue_wait_time(self, queue: str) -> float:
+        from .rate_limiter import parse_rate_limit as _parse
+        config_val, effective_queue = self._resolve_rate_limit_config(queue)
+        if config_val is None:
+            return 0.0
+        count, window = _parse(config_val)
+        burst = self.config.get('RATE_LIMIT_BURST', {}).get(effective_queue, 0)
+        key = self.rate_limiter._rate_limit_key(effective_queue)
+        return self.rate_limiter.estimate_wait_time(key, count + burst, window)
+
+    def peek_queue_rate_limit(self, queue: str) -> bool:
+        from .rate_limiter import parse_rate_limit as _parse
+        config_val, effective_queue = self._resolve_rate_limit_config(queue)
+        if config_val is None:
+            return True
+        count, window = _parse(config_val)
+        key = self.rate_limiter._rate_limit_key(effective_queue)
+        burst = self.config.get('RATE_LIMIT_BURST', {}).get(effective_queue, 0)
+        return self.rate_limiter.peek(key, count + burst, window)
+
+    def reset_queue_rate_limit_window(self, queue: str) -> None:
+        _, effective_queue = self._resolve_rate_limit_config(queue)
+        key = self.rate_limiter._rate_limit_key(effective_queue)
+        self.rate_limiter.reset_window(key)
+
+    def get_all_queue_rate_limits(self) -> Dict[str, str]:
+        dynamic = self.rate_limiter.get_all_configured_limits()
+        result = dict(self.config.get('RATE_LIMITS', {}))
+        result.update(dynamic)
+        return result
+
+    def validate_rate_limit(self, rate_limit_str: str) -> bool:
+        return self.rate_limiter.validate_rate_limit_str(rate_limit_str)
 
     def get_queue_sizes(self, queue: str) -> Dict[str, int]:
         """

@@ -61,6 +61,7 @@ class Task:
         max_queue_size: Optional[int] = None,
         max_stored_executions: Optional[int] = None,
         runner_class: Optional[Type["BaseRunner"]] = None,
+        rate_limit: Optional[str] = None,
         # internal variables
         _data: Any = None,
         _state: Any = None,
@@ -120,6 +121,9 @@ class Task:
         if runner_class is None:
             runner_class = getattr(func, "_task_runner_class", None)
 
+        if rate_limit is None:
+            rate_limit = getattr(func, '_task_rate_limit', None)
+
         # normalize falsy args/kwargs to empty structures
         args = args or []
         kwargs = kwargs or {}
@@ -164,6 +168,8 @@ class Task:
         if runner_class:
             serialized_runner_class = serialize_func_name(runner_class)
             task["runner_class"] = serialized_runner_class
+        if rate_limit:
+            task['rate_limit'] = rate_limit
 
         self._data = task
 
@@ -227,6 +233,10 @@ class Task:
     @property
     def hard_timeout(self) -> Optional[float]:
         return self._data.get("hard_timeout", None)
+
+    @property
+    def rate_limit(self) -> Optional[str]:
+        return self._data.get('rate_limit')
 
     @property
     def unique(self) -> bool:

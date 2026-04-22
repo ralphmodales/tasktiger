@@ -1,11 +1,13 @@
 from .exceptions import (
     JobTimeoutException,
     QueueFullException,
+    RateLimitedException,
     RetryException,
     StopRetry,
     TaskImportError,
     TaskNotFound,
 )
+from .rate_limiter import RateLimitInfo, RateLimiter, parse_rate_limit
 from .retry import exponential, fixed, linear
 from .schedule import cron_expr, periodic
 from .task import Task
@@ -24,6 +26,10 @@ __all__ = [
     "TaskImportError",
     "TaskNotFound",
     "QueueFullException",
+    "RateLimitedException",
+    "RateLimiter",
+    "RateLimitInfo",
+    "parse_rate_limit",
     # Retry methods
     "fixed",
     "linear",

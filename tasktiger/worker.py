@@ -620,10 +620,11 @@ class Worker:
         log: BoundLogger = self.log.bind(queue=queue)
         assert isinstance(log, BoundLogger)
 
-        locks = []
+        locks: List[Any] = []
         # Keep track of the acquired locks: If two tasks in the list require
         # the same lock we only acquire it once.
-        lock_ids = set()
+        lock_ids: Set[str] = set()
+        task_locks: Dict[str, List[Any]] = {}
 
         ready_tasks = []
         for task in tasks:
@@ -664,10 +665,77 @@ class Worker:
 
                     lock_ids.add(lock_id)
                     locks.append(lock)
+                    task_locks.setdefault(task.id, []).append(lock)
 
             ready_tasks.append(task)
 
+        actually_ready = []
+        rl = self.tiger.rate_limiter
+        use_backoff = self.config.get('RATE_LIMIT_BACKOFF_ENABLED', False)
+        backoff_base = self.config.get('RATE_LIMIT_BACKOFF_BASE', 1.0)
+        backoff_max = self.config.get('RATE_LIMIT_BACKOFF_MAX', 60.0)
+        backoff_factor = self.config.get('RATE_LIMIT_BACKOFF_FACTOR', 2.0)
+        burst_config = self.config.get('RATE_LIMIT_BURST', {})
+        fixed_delay = self.config['RATE_LIMIT_RETRY_DELAY']
+
+        for task in ready_tasks:
+            limits = rl.get_effective_limits(
+                queue,
+                task.serialized_func,
+                task.rate_limit,
+                self.config['RATE_LIMITS'],
+                burst_config=burst_config,
+            )
+
+            if limits:
+                allowed, retry_after = rl.consume_multi(limits)
+
+                if not allowed:
+                    if use_backoff:
+                        rl.record_penalty(queue)
+                        delay = rl.compute_backoff_delay(
+                            queue,
+                            backoff_base,
+                            max_delay=backoff_max,
+                            factor=backoff_factor,
+                        )
+                    else:
+                        delay = max(retry_after, fixed_delay)
+
+                    rl.record_rejection(queue)
+
+                    for lk in task_locks.pop(task.id, []):
+                        try:
+                            lk.release()
+                        except LockError:
+                            log.warning('could not release lock', lock=lk.name)
+
+                    when = time.time() + delay
+                    task._move(
+                        from_state=ACTIVE,
+                        to_state=SCHEDULED,
+                        when=when,
+                        mode='min',
+                    )
+                    log.info(
+                        'rate limited',
+                        task_id=task.id,
+                        retry_after=delay,
+                        queue=queue,
+                    )
+                    continue
+
+            actually_ready.append(task)
+
+        ready_tasks = actually_ready
+        locks = [lk for t in ready_tasks for lk in task_locks.get(t.id, [])]
+
         if not ready_tasks:
+            for lock in locks:
+                try:
+                    lock.release()
+                except LockError:
+                    log.warning('could not release lock', lock=lock.name)
             return True, []
 
         if self.stats_thread:
